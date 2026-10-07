@@ -58,3 +58,23 @@ def test_report_names_the_winner_its_command_and_the_skips(ctx, tmp_path):
         "--quantization fp8" in text
     )
     assert "`kv_cache_dtype=fp8`, screen: skipped, no kernel" in text
+
+
+def test_configs_within_noise_of_the_winner_are_named_with_their_quality(ctx, tmp_path):
+    # 1190 / 1150 is a 3.5% gap, under the 5% smallest counted gain
+    close = rec("confirm", 1150, 0.001, weights="org/base-AWQ")
+    text = render(meta(ctx), [*RECORDS, close], tmp_path)
+    assert "trail `weights=fp8` by less than the noise" in text
+    assert "- `weights=org/base-AWQ`: 3.5% lower throughput, noise 5.0%. KL 0.0010 (winner 0.0120)" in text
+
+
+def test_a_noisy_config_widens_the_tie(ctx, tmp_path):
+    # a 6.2% gap is above the 5% smallest counted gain but under this config's 7% CV
+    noisy = rec("confirm", 1120, 0.001, weights="org/base-AWQ") | {"tput_cv": 0.07}
+    assert "6.2% lower throughput, noise 7.0%" in render(meta(ctx), [*RECORDS, noisy], tmp_path)
+    assert "by less than the noise" not in render(meta(ctx), [*RECORDS, noisy | {"tput_cv": 0.05}], tmp_path)
+
+
+def test_no_tie_section_when_the_winner_clears_the_noise(ctx, tmp_path):
+    # fp8 leads the baseline by 17.8%
+    assert "by less than the noise" not in render(meta(ctx), RECORDS, tmp_path)

@@ -14,6 +14,23 @@ def recommendation(records: list[dict], goal: Goal) -> dict | None:
     return max(confirmed, key=goal.score) if confirmed else None
 
 
+def near_ties(records: list[dict], best: dict, goal: Goal) -> list[tuple[dict, float, float]]:
+    """Confirmed configs within the goal that trail the winner by less than the noise, with the gap and the noise.
+
+    The noise is the smallest gain the search counts, or either config's throughput CV across repeats if larger.
+    TPOT has no measured spread, so for the latency goal only the smallest counted gain applies.
+    """
+    out = []
+    for r in records:
+        if r["stage"] != "confirm" or r["key"] == best["key"] or not goal.passes(r):
+            continue
+        cvs = [x.get("tput_cv") or 0 for x in (best, r)] if goal.target == "throughput" else []
+        gap, noise = goal.gain(best, r) - 1, max(goal.min_gain, *cvs)
+        if gap < noise:
+            out.append((r, gap, noise))
+    return sorted(out, key=lambda t: t[1])
+
+
 def pareto_keys(records: list[dict]) -> set[str]:
     """Trials no other trial beats on throughput, TPOT and KL at once."""
     ok = [r for r in records if r["status"] == "ok"]
@@ -116,6 +133,26 @@ def render(meta: dict, records: list[dict], run_dir: Path) -> str:
                 "Differences smaller than these are noise."
             ),
         ]
+        ties = near_ties(records, best, goal)
+        if ties:
+            worse = "lower throughput" if goal.target == "throughput" else "higher TPOT"
+            lines += [
+                "",
+                (
+                    f"These configs trail `{best['label']}` by less than the noise, so the measurements do not "
+                    "separate them from it; choose among them on quality and memory:"
+                ),
+                "",
+            ]
+            lines += [
+                (
+                    f"- `{r['label']}`: {gap * 100:.1f}% {worse}, noise {noise * 100:.1f}%. "
+                    f"KL {r['kl']:.4f} (winner {best['kl']:.4f}), TPOT {r['tpot_ms']:.1f} ms "
+                    f"(winner {best['tpot_ms']:.1f}), KV cache {r['kv_tokens']:,} tokens "
+                    f"(winner {best['kv_tokens']:,})."
+                )
+                for r, gap, noise in ties
+            ]
     else:
         lines.append("No config finished the confirm stage within the goal.")
 
