@@ -1,7 +1,16 @@
 import dataclasses
 import shlex
 
-from vllm_dyno.space import Candidate, Context, engine_args, infeasible_reason, owner, screen_candidates, serve_command
+from vllm_dyno.space import (
+    Candidate,
+    Context,
+    engine_args,
+    infeasible_reason,
+    owner,
+    screen_candidates,
+    serve_command,
+    trusted,
+)
 
 
 def reason(cand: Candidate, ctx: Context) -> str:
@@ -60,9 +69,18 @@ def test_measured_commits_are_pinned_for_serving(ctx):
     assert argv[argv.index("--revision") + 1] == "c0ffee"
 
 
-def test_owner_is_the_account_part_of_a_repo_id():
-    assert owner("Qwen/Qwen2.5-1.5B-Instruct-AWQ") == owner("Qwen/Qwen2.5-1.5B-Instruct") == "Qwen"
-    assert owner("someone/Qwen2.5-1.5B-Instruct-AWQ") != "Qwen"
+def test_owner_is_the_case_insensitive_account_of_a_repo_id():
+    assert owner("Qwen/Qwen2.5-1.5B-Instruct-AWQ") == owner("qwen/Qwen2.5-1.5B-Instruct") == "qwen"
+    assert owner("gpt2") is None
+    assert owner("/abs/path") is None
+
+
+def test_discovery_trusts_only_the_base_model_owner():
+    assert trusted("Qwen/Qwen2.5-1.5B-Instruct-AWQ", "Qwen/Qwen2.5-1.5B-Instruct", any_owner=False)
+    assert not trusted("someone/Qwen2.5-1.5B-Instruct-AWQ", "Qwen/Qwen2.5-1.5B-Instruct", any_owner=False)
+    # a model without an account must not vouch for whoever registered that name as an account
+    assert not trusted("gpt2/gpt2-awq", "gpt2", any_owner=False)
+    assert trusted("someone/gpt2-awq", "gpt2", any_owner=True)
 
 
 def test_context_survives_json(ctx):

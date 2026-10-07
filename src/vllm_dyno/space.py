@@ -165,8 +165,18 @@ def checkpoint_from(repo: str, methods: set[str] = QUANT_METHODS) -> Checkpoint 
     return Checkpoint(repo, method, bits, size, revision)
 
 
-def owner(repo: str) -> str:
-    return repo.split("/", 1)[0]
+def owner(repo: str) -> str | None:
+    """The account part of a Hub repo id. Hub account names are case-insensitive."""
+    account, slash, _ = repo.partition("/")
+    return account.lower() if slash and account else None
+
+
+def trusted(repo: str, model: str, any_owner: bool) -> bool:
+    """Whether discovery may pick `repo` as a checkpoint of `model`.
+
+    A model id without an account (say "gpt2") names no owner, so it vouches for no account.
+    """
+    return any_owner or (owner(model) is not None and owner(repo) == owner(model))
 
 
 def discover_checkpoints(
@@ -185,7 +195,7 @@ def discover_checkpoints(
         tags = set(m.tags or [])
         if tags & SKIP_TAGS or "safetensors" not in tags:
             continue
-        if not any_owner and owner(m.id) != owner(model):
+        if not trusted(m.id, model, any_owner):
             continue
         try:
             ckpt = checkpoint_from(m.id, methods)
