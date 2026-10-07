@@ -17,11 +17,13 @@ pytestmark = [pytest.mark.gpu, pytest.mark.filterwarnings("ignore")]
 
 def test_baseline_writes_a_reference_and_a_rerun_matches_it(tmp_path):
     gpu, host = query_gpu(), host_facts()
-    cfg, weight_bytes = model_files(MODEL)
-    ctx = Context(MODEL, gpu, host, AttentionShape.from_hf_config(cfg), weight_bytes, (), memory_utilization(gpu), 2048)
+    cfg, weight_bytes, revision = model_files(MODEL)
+    shape = AttentionShape.from_hf_config(cfg)
+    ctx = Context(MODEL, gpu, host, shape, weight_bytes, (), memory_utilization(gpu), 2048, revision)
     run = Run(tmp_path)
     run.write_meta({"free_mib_at_start": gpu.free_mib})
-    (tmp_path / "data.json").write_text(json.dumps(data.build(MODEL, None, SCREEN["eval_tokens"], POOL_SIZE)))
+    built = data.build(MODEL, revision, None, SCREEN["eval_tokens"], POOL_SIZE)
+    (tmp_path / "data.json").write_text(json.dumps(built))
     env = child_env(host["nvcc"])
 
     base = run_trial(run, ctx, "screen", Candidate(), SCREEN, write_reference=True, env=env, timeout_s=900)

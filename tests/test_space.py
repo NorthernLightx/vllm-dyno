@@ -1,7 +1,7 @@
 import dataclasses
 import shlex
 
-from vllm_dyno.space import Candidate, Context, engine_args, infeasible_reason, screen_candidates, serve_command
+from vllm_dyno.space import Candidate, Context, engine_args, infeasible_reason, owner, screen_candidates, serve_command
 
 
 def reason(cand: Candidate, ctx: Context) -> str:
@@ -51,5 +51,27 @@ def test_serve_command_round_trips_through_a_shell(ctx):
     assert argv[argv.index("--speculative-config") + 1].startswith('{"method":"ngram"')
 
 
+def test_measured_commits_are_pinned_for_serving(ctx):
+    awq = dataclasses.replace(ctx.checkpoints[0], revision="c0ffee")
+    pinned = dataclasses.replace(ctx, revision="abc123", checkpoints=(awq,))
+    assert engine_args(Candidate(weights="fp8"), pinned)["revision"] == "abc123"
+    assert engine_args(Candidate(weights="org/base-AWQ"), pinned)["revision"] == "c0ffee"
+    argv = shlex.split(serve_command(Candidate(weights="org/base-AWQ"), pinned))
+    assert argv[argv.index("--revision") + 1] == "c0ffee"
+
+
+def test_owner_is_the_account_part_of_a_repo_id():
+    assert owner("Qwen/Qwen2.5-1.5B-Instruct-AWQ") == owner("Qwen/Qwen2.5-1.5B-Instruct") == "Qwen"
+    assert owner("someone/Qwen2.5-1.5B-Instruct-AWQ") != "Qwen"
+
+
 def test_context_survives_json(ctx):
     assert Context.from_json(ctx.to_json()) == ctx
+
+
+def test_context_from_a_run_without_revisions(ctx):
+    old = ctx.to_json()
+    del old["revision"]
+    for c in old["checkpoints"]:
+        del c["revision"]
+    assert Context.from_json(old) == ctx

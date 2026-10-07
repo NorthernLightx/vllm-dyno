@@ -49,6 +49,7 @@ class Checkpoint:
     method: str
     bits: int | None
     weight_bytes: int
+    revision: str | None = None  # commit measured; serving the same commit rules out a repo changed since
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ class Context:
     checkpoints: tuple[Checkpoint, ...]
     util: float
     max_model_len: int
+    revision: str | None = None  # commit of the base model
 
     def checkpoint(self, repo: str) -> Checkpoint | None:
         return next((c for c in self.checkpoints if c.repo == repo), None)
@@ -81,6 +83,7 @@ class Context:
             checkpoints=tuple(Checkpoint(**c) for c in d["checkpoints"]),
             util=d["util"],
             max_model_len=d["max_model_len"],
+            revision=d.get("revision"),
         )
 
 
@@ -89,11 +92,12 @@ def weight_values(ctx: Context) -> list[str]:
 
 
 def engine_args(c: Candidate, ctx: Context) -> dict:
-    args: dict = {
-        "model": ctx.model if c.weights in ("base", "fp8") else c.weights,
-        "gpu_memory_utilization": ctx.util,
-        "max_model_len": ctx.max_model_len,
-    }
+    ckpt = ctx.checkpoint(c.weights)
+    args: dict = {"model": ckpt.repo if ckpt else ctx.model}
+    revision = ckpt.revision if ckpt else ctx.revision
+    if revision:
+        args["revision"] = revision
+    args |= {"gpu_memory_utilization": ctx.util, "max_model_len": ctx.max_model_len}
     if c.weights == "fp8":
         args["quantization"] = "fp8"
     if c.kv_cache_dtype != "auto":
@@ -152,17 +156,27 @@ def infeasible_reason(c: Candidate, ctx: Context) -> str | None:
 
 def checkpoint_from(repo: str, methods: set[str] = QUANT_METHODS) -> Checkpoint | None:
     """The repo as a Checkpoint if its config declares one of `methods`, else None."""
-    cfg, size = model_files(repo)
+    cfg, size, revision = model_files(repo)
     q = cfg.get("quantization_config") or {}
     method = q.get("quant_method")
     if method not in methods:
         return None
     bits = q.get("bits") or q.get("w_bit") or (4 if q.get("load_in_4bit") else 8 if q.get("load_in_8bit") else None)
-    return Checkpoint(repo, method, bits, size)
+    return Checkpoint(repo, method, bits, size, revision)
 
 
-def discover_checkpoints(model: str, limit: int, methods: set[str] = QUANT_METHODS, scan: int = 50) -> list[Checkpoint]:
-    """Most downloaded quantized derivatives of `model` on the Hub, one per (method, bits), in `methods`."""
+def owner(repo: str) -> str:
+    return repo.split("/", 1)[0]
+
+
+def discover_checkpoints(
+    model: str, limit: int, methods: set[str] = QUANT_METHODS, any_owner: bool = False, scan: int = 50
+) -> list[Checkpoint]:
+    """Most downloaded quantized derivatives of `model` on the Hub, one per (method, bits), in `methods`.
+
+    Unless `any_owner`, only repos published by the base model's owner count: a recommendation
+    puts these weights into production, and anyone can upload a derivative.
+    """
     from huggingface_hub import HfApi
     from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
 
@@ -170,6 +184,8 @@ def discover_checkpoints(model: str, limit: int, methods: set[str] = QUANT_METHO
     for m in HfApi().list_models(filter=f"base_model:quantized:{model}", sort="downloads", limit=scan):
         tags = set(m.tags or [])
         if tags & SKIP_TAGS or "safetensors" not in tags:
+            continue
+        if not any_owner and owner(m.id) != owner(model):
             continue
         try:
             ckpt = checkpoint_from(m.id, methods)

@@ -30,9 +30,13 @@ def _build_context(args: argparse.Namespace):
 
     gpu = query_gpu()
     host = host_facts()
-    cfg, base_bytes = model_files(args.model)
+    cfg, base_bytes, revision = model_files(args.model)
     methods = QUANT_METHODS if host["bitsandbytes"] else QUANT_METHODS - {"bitsandbytes"}
-    checkpoints = [] if args.no_discover else discover_checkpoints(args.model, args.max_checkpoints, methods)
+    checkpoints = (
+        []
+        if args.no_discover
+        else discover_checkpoints(args.model, args.max_checkpoints, methods, any_owner=args.any_owner)
+    )
     for repo in args.checkpoint:
         ckpt = checkpoint_from(repo)
         if ckpt is None:
@@ -50,6 +54,7 @@ def _build_context(args: argparse.Namespace):
         checkpoints=tuple(checkpoints),
         util=util,
         max_model_len=args.max_model_len,
+        revision=revision,
     )
     return ctx
 
@@ -80,7 +85,14 @@ def _log_plan(ctx) -> None:
         ctx.util,
     )
     for c in ctx.checkpoints:
-        log.info("found    %s (%s, %s-bit, %.2f GiB)", c.repo, c.method, c.bits, c.weight_bytes / GIB)
+        log.info(
+            "found    %s@%s (%s, %s-bit, %.2f GiB)",
+            c.repo,
+            (c.revision or "")[:8],
+            c.method,
+            c.bits,
+            c.weight_bytes / GIB,
+        )
     for cand in screen_candidates(ctx):
         reason = infeasible_reason(cand, ctx)
         log.info("plan     %-55s %s", cand.label(), f"skip: {reason}" if reason else "run")
@@ -93,14 +105,14 @@ def _prepare(run, ctx, args) -> None:
     from .search import CONFIRM, POOL_SIZE
     from .space import infeasible_reason, screen_candidates
 
-    repos = {ctx.model} | {
-        c.weights for c in screen_candidates(ctx) if "/" in c.weights and not infeasible_reason(c, ctx)
-    }
-    for repo in sorted(repos):
-        log.info("download %s", repo)
-        snapshot_download(repo, ignore_patterns=IGNORE_FILES)
+    runnable = {c.weights for c in screen_candidates(ctx) if not infeasible_reason(c, ctx)}
+    repos = {ctx.model: ctx.revision} | {c.repo: c.revision for c in ctx.checkpoints if c.repo in runnable}
+    for repo, revision in sorted(repos.items()):
+        log.info("download %s@%s", repo, (revision or "")[:8])
+        snapshot_download(repo, revision=revision, ignore_patterns=IGNORE_FILES)
     log.info("data     tokenizing %s", args.text or "WikiText-2")
-    (run.path / "data.json").write_text(json.dumps(data.build(ctx.model, args.text, CONFIRM["eval_tokens"], POOL_SIZE)))
+    built = data.build(ctx.model, ctx.revision, args.text, CONFIRM["eval_tokens"], POOL_SIZE)
+    (run.path / "data.json").write_text(json.dumps(built))
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -210,6 +222,11 @@ def main(argv: list[str] | None = None) -> None:
         "--checkpoint", action="append", default=[], help="quantized checkpoint repo to include (repeatable)"
     )
     run.add_argument("--no-discover", action="store_true", help="don't look for quantized checkpoints on the Hub")
+    run.add_argument(
+        "--any-owner",
+        action="store_true",
+        help="also discover checkpoints published by accounts other than the base model's owner",
+    )
     run.add_argument(
         "--max-checkpoints", type=int, default=3, help="discovered checkpoints to try, one per method and bit width"
     )

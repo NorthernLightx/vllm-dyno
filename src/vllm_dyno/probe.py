@@ -109,11 +109,11 @@ def kv_bytes_per_token(shape: AttentionShape, dtype_bytes: float = 2) -> int:
     return int(2 * shape.num_layers * shape.num_kv_heads * shape.head_dim * dtype_bytes)
 
 
-def model_files(repo: str) -> tuple[dict, int]:
-    """config.json and the total size of the safetensors weights, without downloading the weights."""
+def model_files(repo: str) -> tuple[dict, int, str | None]:
+    """config.json, the total size of the safetensors weights and the current commit, without downloading weights."""
     from huggingface_hub import HfApi, hf_hub_download
 
-    cfg = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
     info = HfApi().model_info(repo, files_metadata=True)
+    cfg = json.loads(Path(hf_hub_download(repo, "config.json", revision=info.sha)).read_text())
     weight_bytes = sum(s.size or 0 for s in info.siblings or [] if s.rfilename.endswith(".safetensors"))
-    return cfg, weight_bytes
+    return cfg, weight_bytes, info.sha

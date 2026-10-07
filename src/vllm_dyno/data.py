@@ -18,11 +18,11 @@ def wikitext(split: str) -> str:
     return "".join(pq.read_table(path).column("text").to_pylist())
 
 
-def build(model: str, text_file: Path | None, eval_tokens: int, pool_size: int) -> dict:
+def build(model: str, revision: str | None, text_file: Path | None, eval_tokens: int, pool_size: int) -> dict:
     """Quality reads WikiText-2 test and speed prompts come from train; a user file supplies both, in that order."""
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=False)
     if tok is None:
         raise SystemExit(f"{model} has no tokenizer")
     pool_tokens = pool_size * SEQ_LEN

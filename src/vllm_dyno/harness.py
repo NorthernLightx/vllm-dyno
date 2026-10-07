@@ -118,7 +118,8 @@ def main(spec_path: str) -> None:
     from vllm.inputs import TokensPrompt
 
     t0 = time.perf_counter()
-    llm = LLM(**spec["engine"], seed=0)
+    # checkpoints can come from the Hub; never run code shipped inside a model repo
+    llm = LLM(**spec["engine"], seed=0, trust_remote_code=False)
     load_s = time.perf_counter() - t0
     cache = llm.llm_engine.vllm_config.cache_config
     pool = iter(data["speed_prompts"])

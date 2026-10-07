@@ -48,7 +48,7 @@ uv run dyno run <model> --dry-run    # the plan, without loading anything on the
 
 ## How it works
 
-Before loading anything, vllm-dyno reads the GPU's free memory and compute capability, checks for nvcc, works out the model's weight size and KV cache bytes per token, and looks up the most downloaded quantized checkpoints of the model on the Hugging Face Hub (one per method and bit width). It skips configs known to fail on this machine and logs the reason.
+Before loading anything, vllm-dyno reads the GPU's free memory and compute capability, checks for nvcc, works out the model's weight size and KV cache bytes per token, and looks up the most downloaded quantized checkpoints of the model on the Hugging Face Hub, one per method and bit width. Only checkpoints published by the base model's owner count unless you pass `--any-owner`, since the recommended weights end up in production. Every model is pinned to the commit measured, and the recommended `vllm serve` command carries that `--revision`. vllm-dyno never runs code from a model repo (`trust_remote_code` stays off). It skips configs known to fail on this machine and logs the reason.
 
 The search space has four settings: weights (as published, fp8 at load time, or a quantized checkpoint), KV cache dtype, attention backend, and ngram speculative decoding. The search runs in three stages:
 
@@ -75,6 +75,7 @@ Every trial is a line in `runs/<run>/trials.jsonl`, with its vLLM log in `runs/<
 - `--gpu-price` adds cost per million output tokens, given USD per GPU hour.
 - `--text` measures quality and speed on your own text instead of WikiText-2.
 - `--checkpoint` adds a quantized checkpoint that discovery did not pick.
+- `--any-owner` lets discovery consider checkpoints from other accounts.
 
 ## Limitations
 
