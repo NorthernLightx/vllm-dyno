@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Run directories written by dyno run
+runs/
