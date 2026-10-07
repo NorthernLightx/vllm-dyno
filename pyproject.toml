@@ -1,0 +1,40 @@
+[project]
+name = "vllm-dyno"
+version = "0.1.0"
+description = "Measures vLLM serving configs on your GPU and recommends one that meets your latency, quality and cost targets."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.31,<0.32"]
+
+[project.scripts]
+dyno = "vllm_dyno.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9.1", "ruff>=0.16", "ty==0.0.85"]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# vLLM's CUDA builds depend on wheels that exist only for Linux x86_64 and aarch64; Windows users run it in WSL
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest]
+minversion = "9.0"
+strict = true
+testpaths = ["tests"]
+addopts = ["-ra", "-m", "not gpu"]
+filterwarnings = ["error"]
+markers = ["gpu: starts vLLM on a CUDA GPU; run with -m gpu"]
