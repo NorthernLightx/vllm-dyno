@@ -85,3 +85,22 @@ def test_latency_goal_ties_on_tpot(ctx, tmp_path):
     close = rec("confirm", 1150, 0.001, weights="org/base-AWQ")
     latency = meta(ctx) | {"goal": asdict(Goal(target="latency"))}
     assert "- `weights=org/base-AWQ`: 3.5% higher TPOT, noise 5.0%." in render(latency, [*RECORDS, close], tmp_path)
+
+
+def test_report_shows_capacity_under_load(ctx, tmp_path):
+    slo = {"ttft_ms": 1000, "tpot_ms": 50, "share": 0.9}
+    ok = {
+        "label": "baseline",
+        "status": "ok",
+        "slo": slo,
+        "capacity_rps": 11.31,
+        "capped": False,
+        "chat": {"ttft_p90_ms": 210.0, "tpot_p90_ms": 41.2},
+        "batch": {"tput_tok_s": 2500.0, "tpot_p50_ms": 30.5},
+        "kv_tokens": 44624,
+    }
+    failed = {"label": "weights=fp8", "status": "oom", "slo": slo}
+    text = render(meta(ctx), RECORDS, tmp_path, [ok, failed])
+    assert "capacity is the highest rate at which 90% of requests had TTFT ≤ 1000 ms and TPOT ≤ 50 ms" in text
+    assert "| `baseline` | 11.31 | 210 | 41.2 | 2,500 | 30.5 | 44,624 |" in text
+    assert "| `weights=fp8` | oom |" in text

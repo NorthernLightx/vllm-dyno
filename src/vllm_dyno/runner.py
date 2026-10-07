@@ -84,11 +84,13 @@ class Run:
             f.write(json.dumps(record) + "\n")
 
 
-def _slug(text: str) -> str:
+def slug(text: str) -> str:
+    """A config label as a directory name."""
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")[:60]
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
+def kill_group(proc: subprocess.Popen) -> None:
+    """Kill a process started with start_new_session=True and everything it spawned."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)  # vLLM's engine core is a child process; take it down too
     except ProcessLookupError:
@@ -132,7 +134,7 @@ def run_trial(
     key = trial_key(stage, cand)
     if record := run.find(key):
         return record
-    trial_dir = run.path / "trials" / f"{len(run.records):03d}-{stage}-{_slug(cand.label())}"
+    trial_dir = run.path / "trials" / f"{len(run.records):03d}-{stage}-{slug(cand.label())}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     spec = {
         "engine": engine_args(cand, ctx),
@@ -154,10 +156,10 @@ def run_trial(
         except subprocess.TimeoutExpired:
             code = None
         except KeyboardInterrupt:
-            _kill_group(proc)
+            kill_group(proc)
             raise
         finally:
-            _kill_group(proc)
+            kill_group(proc)
     if code is None:
         status, error = "timeout", f"no result after {timeout_s:.0f} s"
     elif (trial_dir / "metrics.json").exists():

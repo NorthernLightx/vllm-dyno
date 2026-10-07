@@ -116,6 +116,7 @@ def _prepare(run, ctx, args) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    from .load import load_records
     from .probe import child_env
     from .report import recommendation, render
     from .runner import HARNESS_SHA, Run
@@ -162,7 +163,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     searcher = Searcher(run, ctx, goal, env=child_env(ctx.host["nvcc"]), timeout_s=args.trial_timeout)
     searcher.search(confirm_top=args.confirm_top, max_combos=args.max_combos)
-    (out / "report.md").write_text(render(run.meta, run.records, out))
+    (out / "report.md").write_text(render(run.meta, run.records, out, load_records(out)))
     best = recommendation(run.records, goal)
     if best:
         log.info("best     %s", best["label"])
@@ -170,12 +171,70 @@ def cmd_run(args: argparse.Namespace) -> None:
     log.info("report   %s", out / "report.md")
 
 
+def cmd_load(args: argparse.Namespace) -> None:
+    from .load import LOAD_SHA, Slo, load_records, measure_config, prompt_pool, targets
+    from .probe import child_env, query_gpu
+    from .report import render
+    from .runner import Run, slug, wait_for_gpu
+    from .space import Context
+
+    run = Run(args.run_dir)
+    if not (args.run_dir / "run.json").exists():
+        raise SystemExit(f"{args.run_dir} is not a run directory")
+    _setup_logging(args.run_dir / "dyno.log")
+    ctx = Context.from_json(run.meta["context"])
+    slo = Slo(args.slo_ttft_ms, args.slo_tpot_ms, args.slo_share)
+    settings = {"slo": asdict(slo), "probe_s": args.probe_seconds, "load_sha": LOAD_SHA}
+    meta_path = args.run_dir / "load.json"
+    gpu = query_gpu()
+    free_mib = gpu.free_mib
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        if {k: meta.get(k) for k in settings} != settings:
+            raise SystemExit(
+                f"{meta_path} was measured with other SLO settings or load code; "
+                "delete load.json and load.jsonl to measure again"
+            )
+        free_mib = meta["free_mib_at_start"]
+    else:
+        meta = {**settings, "created": time.strftime("%Y-%m-%d %H:%M"), "free_mib_at_start": free_mib}
+        meta_path.write_text(json.dumps(meta, indent=2))
+    if gpu.free_mib < ctx.util * gpu.total_mib:
+        raise SystemExit(
+            f"{gpu.free_mib:,} MiB GPU memory is free; this run's gpu_memory_utilization {ctx.util} "
+            f"needs {ctx.util * gpu.total_mib:,.0f}"
+        )
+
+    pool = prompt_pool(json.loads((args.run_dir / "data.json").read_text()))
+    env = child_env(ctx.host["nvcc"])
+    done = {r["label"] for r in load_records(args.run_dir)}
+    for r in targets(run.records, args.config):
+        if r["label"] in done:
+            log.info("load     %s recorded earlier", r["label"])
+            continue
+        out_dir = args.run_dir / "load" / f"{len(done):03d}-{slug(r['label'])}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        record = measure_config(
+            r, ctx, pool, slo, args.probe_seconds, env=env, out_dir=out_dir, timeout_s=args.server_timeout
+        )
+        record["dir"] = str(out_dir.relative_to(args.run_dir))
+        with (args.run_dir / "load.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        done.add(r["label"])
+        if record["status"] != "ok":
+            log.info("load     %s %s: %s", r["label"], record["status"], record["error"])
+        wait_for_gpu(free_mib)
+    (args.run_dir / "report.md").write_text(render(run.meta, run.records, args.run_dir, load_records(args.run_dir)))
+    log.info("report   %s", args.run_dir / "report.md")
+
+
 def cmd_report(args: argparse.Namespace) -> None:
+    from .load import load_records
     from .report import render
     from .runner import Run
 
     run = Run(args.run_dir)
-    text = render(run.meta, run.records, args.run_dir)
+    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir))
     (args.run_dir / "report.md").write_text(text)
     print(text)
 
@@ -238,6 +297,21 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--out", type=Path, help="run directory; pass an existing one to resume it")
     run.add_argument("--dry-run", action="store_true", help="print the plan without loading any model on the GPU")
     run.set_defaults(func=cmd_run)
+
+    load = sub.add_parser("load", help="measure a run's confirmed configs under online load through vllm serve")
+    load.add_argument("run_dir", type=Path)
+    load.add_argument(
+        "--config",
+        action="append",
+        default=[],
+        help="trial label to load instead of the confirmed configs (repeatable)",
+    )
+    load.add_argument("--slo-ttft-ms", type=float, default=1000, help="time to first token a request may take")
+    load.add_argument("--slo-tpot-ms", type=float, default=50, help="time per output token a request may take")
+    load.add_argument("--slo-share", type=float, default=0.9, help="share of requests that must meet both limits")
+    load.add_argument("--probe-seconds", type=float, default=30, help="arrival window of each chat probe")
+    load.add_argument("--server-timeout", type=float, default=600, help="seconds to wait for vllm serve to answer")
+    load.set_defaults(func=cmd_load)
 
     report = sub.add_parser("report", help="rewrite and print report.md for a run directory")
     report.add_argument("run_dir", type=Path)

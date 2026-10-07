@@ -1,9 +1,11 @@
-"""report.md from run.json and trials.jsonl."""
+"""report.md from run.json, trials.jsonl and load.jsonl."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
+from .load import BATCH_REQUESTS, MIN_RATE, OUTPUT_LEN, PRECISION, PROMPT_LEN
 from .probe import serve_env
 from .search import Goal, candidate_of
 from .space import Context, serve_command
@@ -61,7 +63,7 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     ]
 
 
-def render(meta: dict, records: list[dict], run_dir: Path) -> str:
+def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] = ()) -> str:
     ctx = Context.from_json(meta["context"])
     goal = Goal(**meta["goal"])
     price = meta.get("gpu_price")
@@ -175,6 +177,41 @@ def render(meta: dict, records: list[dict], run_dir: Path) -> str:
             ]
             for r in sorted(confirm, key=goal.score, reverse=True)
         ]
+        lines += _table(header, rows)
+
+    if load:
+        slo = load[0]["slo"]
+        lines += [
+            "",
+            "## Under load",
+            "",
+            (
+                f"Through `vllm serve` with its serving defaults. Chat: {PROMPT_LEN}-token prompts with "
+                f"{OUTPUT_LEN}-token answers arriving as a Poisson process; capacity is the highest rate at which "
+                f"{slo['share']:.0%} of requests had TTFT ≤ {slo['ttft_ms']:.0f} ms and TPOT ≤ {slo['tpot_ms']:.0f} ms, "
+                f"found to within {PRECISION:.0%}. Batch: {BATCH_REQUESTS} such requests at once. "
+                "KV tokens as the server reports them."
+            ),
+            "",
+        ]
+        rows = []
+        for r in load:
+            if r["status"] != "ok":
+                rows.append([f"`{r['label']}`", r["status"], "", "", "", "", ""])
+                continue
+            cap, chat, batch = r["capacity_rps"], r.get("chat") or {}, r["batch"]
+            rows.append(
+                [
+                    f"`{r['label']}`",
+                    f"< {MIN_RATE:g}" if cap is None else f"≥ {cap:g}" if r["capped"] else f"{cap:.2f}",
+                    _f(chat.get("ttft_p90_ms"), ".0f"),
+                    _f(chat.get("tpot_p90_ms"), ".1f"),
+                    f"{batch['tput_tok_s']:,.0f}",
+                    _f(batch.get("tpot_p50_ms"), ".1f"),
+                    _f(r.get("kv_tokens"), ","),
+                ]
+            )
+        header = ["config", "chat req/s", "TTFT p90 ms", "TPOT p90 ms", "batch tok/s", "batch TPOT p50 ms", "KV tokens"]
         lines += _table(header, rows)
 
     singles = [r for r in records if r["stage"] == "screen" and len(candidate_of(r).changes()) == 1]

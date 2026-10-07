@@ -3449,6 +3449,7 @@ name = "vllm-dyno"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "huggingface-hub" },
 ]
 
@@ -3467,6 +3468,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "pyarrow", marker = "extra == 'vllm'" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.31,<0.32" },
