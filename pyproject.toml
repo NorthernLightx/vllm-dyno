@@ -6,10 +6,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["huggingface-hub"]
 
 [project.optional-dependencies]
-vllm = ["vllm>=0.31,<0.32"]
+vllm = ["vllm>=0.31,<0.32", "pyarrow"]
 
 [project.scripts]
 dyno = "vllm_dyno.cli:main"
@@ -30,6 +30,10 @@ environments = [
 
 [tool.ruff]
 line-length = 120
+
+[tool.ty.analysis]
+# installed only with the vllm extra, which CI skips
+allowed-unresolved-imports = ["vllm", "vllm.**", "numpy", "transformers", "pyarrow.**"]
 
 [tool.pytest]
 minversion = "9.0"
