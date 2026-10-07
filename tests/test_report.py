@@ -78,3 +78,10 @@ def test_a_noisy_config_widens_the_tie(ctx, tmp_path):
 def test_no_tie_section_when_the_winner_clears_the_noise(ctx, tmp_path):
     # fp8 leads the baseline by 17.8%
     assert "by less than the noise" not in render(meta(ctx), RECORDS, tmp_path)
+
+
+def test_latency_goal_ties_on_tpot(ctx, tmp_path):
+    # TPOT 10000/1150 against the winner's 10000/1190 is 3.5% higher
+    close = rec("confirm", 1150, 0.001, weights="org/base-AWQ")
+    latency = meta(ctx) | {"goal": asdict(Goal(target="latency"))}
+    assert "- `weights=org/base-AWQ`: 3.5% higher TPOT, noise 5.0%." in render(latency, [*RECORDS, close], tmp_path)

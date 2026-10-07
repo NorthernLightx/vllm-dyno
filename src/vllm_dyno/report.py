@@ -25,7 +25,7 @@ def near_ties(records: list[dict], best: dict, goal: Goal) -> list[tuple[dict, f
         if r["stage"] != "confirm" or r["key"] == best["key"] or not goal.passes(r):
             continue
         cvs = [x.get("tput_cv") or 0 for x in (best, r)] if goal.target == "throughput" else []
-        gap, noise = goal.gain(best, r) - 1, max(goal.min_gain, *cvs)
+        gap, noise = goal.gain(best, r) - 1, max([goal.min_gain, *cvs])
         if gap < noise:
             out.append((r, gap, noise))
     return sorted(out, key=lambda t: t[1])
