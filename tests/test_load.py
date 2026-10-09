@@ -34,6 +34,7 @@ def test_requests_send_token_ids_each_with_its_own_cache_salt():
     assert [(t.tokens, t.error) for t in timings] == [(8, None), (8, None)]
     assert sorted(b["prompt"] for b in bodies) == [[1, 2, 3], [4, 5, 6]]
     assert all(b["ignore_eos"] and b["stream"] and b["temperature"] == 0 for b in bodies)
+    assert all(b["repetition_penalty"] == 1 for b in bodies)
     assert bodies[0]["cache_salt"] != bodies[1]["cache_salt"]
 
 

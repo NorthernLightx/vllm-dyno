@@ -10,6 +10,10 @@ Every request carries its own cache_salt, so prompts from the pool can repeat wi
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
 offline engine's: below 70 GiB of GPU memory, max_num_batched_tokens is 2048 instead of 8192.
 
+Requests decode greedily without penalties, as the offline harness does, whatever the model's
+generation_config asks for. vLLM sizes its memory budget without penalty buffers; with 256
+requests running, Qwen2.5's repetition_penalty 1.1 took over 2 GiB more and overflowed an 8 GB GPU.
+
 <run>/load.json      SLO and settings; a resumed load must match them
 <run>/load.jsonl     one line per config
 <run>/load/NNN-*/    server.log of one config
@@ -105,6 +109,7 @@ async def stream_one(client: httpx.AsyncClient, model: str, prompt: list[int], m
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0,
+        "repetition_penalty": 1.0,
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
