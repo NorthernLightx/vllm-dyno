@@ -1,6 +1,8 @@
 from dataclasses import asdict
 
-from vllm_dyno.report import pareto_keys, recommendation, render
+import pytest
+
+from vllm_dyno.report import load_recommendation, pareto_keys, recommendation, render
 from vllm_dyno.search import Goal
 from vllm_dyno.space import Candidate
 
@@ -87,12 +89,15 @@ def test_latency_goal_ties_on_tpot(ctx, tmp_path):
     assert "- `weights=org/base-AWQ`: 3.5% higher TPOT, noise 5.0%." in render(latency, [*RECORDS, close], tmp_path)
 
 
-def load_rec(label: str, session: str, capacity: float, batch: float) -> dict:
+def load_rec(label: str, session: str, capacity: float, batch: float, backend: str = "FLASH_ATTN") -> dict:
+    cand = Candidate() if label == "baseline" else Candidate(**dict(kv.split("=") for kv in label.split()))
     return {
         "label": label,
+        **asdict(cand),
         "status": "ok",
         "slo": {"ttft_ms": 1000, "tpot_ms": 50, "share": 0.9},
         "session": session,
+        "backend": backend,
         "capacity_rps": capacity,
         "capped": False,
         "chat": {"ttft_p90_ms": 210.0, "tpot_p90_ms": 41.2},
@@ -107,11 +112,64 @@ def test_report_shows_capacity_under_load_against_the_baseline_of_the_same_sessi
         load_rec("baseline", "night", 10.0, 2000.0),
         load_rec("weights=fp8", "night", 11.31, 2500.0),
         load_rec("baseline", "morning", 12.0, 2400.0),
-        load_rec("attention_backend=TRITON_ATTN", "morning", 15.0, 2400.0),
+        load_rec("attention_backend=TRITON_ATTN", "morning", 15.0, 2400.0, backend="TRITON_ATTN"),
         failed | {"session": "morning"},
     ]
     text = render(meta(ctx), RECORDS, tmp_path, load)
     assert "capacity is the highest rate at which 90% of requests had TTFT ≤ 1000 ms and TPOT ≤ 50 ms" in text
-    assert "| `weights=fp8` | 11.31 | 1.13x | 210 | 41.2 | 2,500 | 1.25x | 30.5 | 44,624 |" in text
-    assert "| `attention_backend=TRITON_ATTN` | 15.00 | 1.25x | 210 | 41.2 | 2,400 | 1.00x | 30.5 | 44,624 |" in text
-    assert "| `kv_cache_dtype=fp8` | oom |" in text
+    assert "| `weights=fp8` | FLASH_ATTN | 11.31 | 1.13x | 210 | 41.2 | 2,500 | 1.25x | 44,624 | 0.0120 |" in text
+    assert "| `attention_backend=TRITON_ATTN` | TRITON_ATTN | 15.00 | 1.25x | 210 | 41.2 | 2,400 | 1.00x |" in text
+    assert "| `kv_cache_dtype=fp8` |  | oom |" in text
+
+
+GPTQ = "org/base-AWQ"  # a checkpoint the ctx fixture knows
+# Qwen2.5-1.5B on an RTX 3070: chat req/s and batch tok/s of one session, and offline KL
+LOADED = {
+    "baseline": (19.03, 2438, 0.0),
+    f"weights={GPTQ}": (18.22, 2806, 0.0006),
+    f"weights={GPTQ} attention_backend=TRITON_ATTN": (22.63, 2937, 0.0006),
+    "weights=fp8 attention_backend=TRITON_ATTN": (22.63, 3035, 0.0075),
+    "weights=fp8 kv_cache_dtype=int8_per_token_head": (22.63, 3082, 0.0234),
+    "attention_backend=TRITON_ATTN": (21.67, 2399, 0.0006),
+    "weights=org/base-GPTQ-3bit attention_backend=TRITON_ATTN": (30.0, 3500, 0.07),  # fast, over the KL limit
+}
+
+
+def loaded_run(ctx) -> tuple[list[dict], list[dict]]:
+    load, records = [], []
+    for label, (chat, batch, kl) in LOADED.items():
+        load.append(load_rec(label, "s", chat, batch))
+        cand = load_rec(label, "s", 0, 0)
+        changes = {
+            k: cand[k] for k in ("weights", "kv_cache_dtype", "attention_backend") if cand[k] != asdict(Candidate())[k]
+        }
+        records.append(rec("combine" if len(changes) > 1 else "screen", 1000, kl, **changes))
+    return load, records
+
+
+@pytest.mark.parametrize("target", ["chat", "batch"])
+def test_load_recommendation_breaks_ties_on_the_other_profile_then_quality(ctx, target):
+    load, records = loaded_run(ctx)
+    picked = load_recommendation(load, records, Goal(), target)
+    assert picked is not None
+    best, ties = picked
+    assert best["label"] == f"weights={GPTQ} attention_backend=TRITON_ATTN"
+    tied = {r["label"] for r in ties}
+    assert "weights=fp8 kv_cache_dtype=int8_per_token_head" in tied
+    assert "weights=org/base-GPTQ-3bit attention_backend=TRITON_ATTN" not in tied
+    assert ("attention_backend=TRITON_ATTN" in tied) == (target == "chat")
+
+
+def test_report_recommends_the_load_pick_and_keeps_the_offline_one_below(ctx, tmp_path):
+    load, records = loaded_run(ctx)
+    text = render(meta(ctx), [*RECORDS, *records], tmp_path, load, "chat")
+    pick = text[text.index("## Recommendation") : text.index("### Without load")]
+    assert pick.startswith(
+        f"## Recommendation\n\n`weights={GPTQ} attention_backend=TRITON_ATTN` for chat traffic: "
+        "chat 22.63 req/s (1.19x the baseline), batch 2,937 tok/s (1.20x)"
+    )
+    assert (
+        f"vllm serve {GPTQ} --gpu-memory-utilization 0.63 --max-model-len 2048 --attention-backend TRITON_ATTN" in pick
+    )
+    assert "- `weights=fp8 attention_backend=TRITON_ATTN`: chat 22.63 req/s (1.19x the baseline)" in pick
+    assert "`weights=fp8`: 1,190 tok/s" in text[text.index("### Without load") :]

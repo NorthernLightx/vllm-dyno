@@ -389,6 +389,12 @@ def targets(records: list[dict], labels: list[str]) -> list[dict]:
     return out
 
 
+def load_goal(run_dir: Path) -> str:
+    """The traffic profile, "chat" or "batch", that the last `dyno load` of the run recommends a config for."""
+    path = run_dir / "load.json"
+    return json.loads(path.read_text()).get("goal", "chat") if path.exists() else "chat"
+
+
 def load_records(run_dir: Path) -> list[dict]:
     """The lines of <run>/load.jsonl, if any."""
     path = run_dir / "load.jsonl"

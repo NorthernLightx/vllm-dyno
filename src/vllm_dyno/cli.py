@@ -116,7 +116,7 @@ def _prepare(run, ctx, args) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    from .load import load_records
+    from .load import load_goal, load_records
     from .probe import child_env
     from .report import recommendation, render
     from .runner import HARNESS_SHA, Run
@@ -163,7 +163,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     searcher = Searcher(run, ctx, goal, env=child_env(ctx.host["nvcc"]), timeout_s=args.trial_timeout)
     searcher.search(confirm_top=args.confirm_top, max_combos=args.max_combos)
-    (out / "report.md").write_text(render(run.meta, run.records, out, load_records(out)))
+    (out / "report.md").write_text(render(run.meta, run.records, out, load_records(out), load_goal(out)))
     best = recommendation(run.records, goal)
     if best:
         log.info("best     %s", best["label"])
@@ -172,7 +172,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_load(args: argparse.Namespace) -> None:
-    from .load import LOAD_SHA, LoadSession, Slo, load_records, prompt_pool, targets
+    from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
     from .probe import child_env, query_gpu
     from .report import render
     from .runner import HARNESS_SHA, Run
@@ -204,7 +204,7 @@ def cmd_load(args: argparse.Namespace) -> None:
         free_mib = meta["free_mib_at_start"]
     else:
         meta = {**settings, "created": time.strftime("%Y-%m-%d %H:%M"), "free_mib_at_start": free_mib}
-        meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta | {"goal": args.goal}, indent=2))
     if gpu.free_mib < ctx.util * gpu.total_mib:
         raise SystemExit(
             f"{gpu.free_mib:,} MiB GPU memory is free; this run's gpu_memory_utilization {ctx.util} "
@@ -222,17 +222,18 @@ def cmd_load(args: argparse.Namespace) -> None:
                 session.measure(r)
     else:
         session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
-    (args.run_dir / "report.md").write_text(render(run.meta, run.records, args.run_dir, load_records(args.run_dir)))
+    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir), load_goal(args.run_dir))
+    (args.run_dir / "report.md").write_text(text)
     log.info("report   %s", args.run_dir / "report.md")
 
 
 def cmd_report(args: argparse.Namespace) -> None:
-    from .load import load_records
+    from .load import load_goal, load_records
     from .report import render
     from .runner import Run
 
     run = Run(args.run_dir)
-    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir))
+    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir), load_goal(args.run_dir))
     (args.run_dir / "report.md").write_text(text)
     print(text)
 
@@ -241,14 +242,17 @@ def cmd_serve(args: argparse.Namespace) -> None:
     import os
     import shlex
 
+    from .load import load_goal, load_records
     from .probe import child_env, host_facts
-    from .report import recommendation
+    from .report import load_recommendation, recommendation
     from .runner import Run
     from .search import Goal, candidate_of
     from .space import Context, serve_command
 
     run = Run(args.run_dir)
-    best = recommendation(run.records, Goal(**run.meta["goal"]))
+    goal = Goal(**run.meta["goal"])
+    under_load = load_recommendation(load_records(args.run_dir), run.records, goal, load_goal(args.run_dir))
+    best = under_load[0] if under_load else recommendation(run.records, goal)
     if best is None:
         raise SystemExit(f"{args.run_dir} has no recommendation; run `dyno run` to completion first")
     argv = shlex.split(serve_command(candidate_of(best), Context.from_json(run.meta["context"]))) + args.vllm_args
@@ -305,6 +309,9 @@ def main(argv: list[str] | None = None) -> None:
         action="append",
         default=[],
         help="trial label to load instead of searching (repeatable); the baseline is always loaded",
+    )
+    load.add_argument(
+        "--goal", choices=["chat", "batch"], default="chat", help="traffic profile to recommend a config for"
     )
     load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
     load.add_argument(

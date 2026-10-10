@@ -5,10 +5,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from .load import BATCH_REQUESTS, MIN_RATE, OUTPUT_LEN, PRECISION, PROMPT_LEN, gains, session_baseline
+from .load import (
+    BATCH_REQUESTS,
+    LOAD_MIN_GAIN,
+    MIN_RATE,
+    OUTPUT_LEN,
+    PRECISION,
+    PROMPT_LEN,
+    gains,
+    session_baseline,
+)
 from .probe import serve_env
 from .search import Goal, candidate_of
-from .space import Context, serve_command
+from .space import Candidate, Context, serve_command
 
 
 def recommendation(records: list[dict], goal: Goal) -> dict | None:
@@ -67,7 +76,151 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     ]
 
 
-def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] = ()) -> str:
+_LOAD_TARGETS = {"chat": "highest chat capacity under the SLO", "batch": "highest batch throughput"}
+
+
+def load_recommendation(
+    load: Sequence[dict], records: list[dict], goal: Goal, target: str
+) -> tuple[dict, list[dict]] | None:
+    """The load record to serve for `target` ("chat" or "batch"), and those the measurements did not separate from it.
+
+    Configs within LOAD_MIN_GAIN of the best on the target are tied with it. Among them the other profile
+    decides the same way, and then the lowest KL. Only configs within the KL limit count.
+    """
+    scored: dict[str, tuple[dict, tuple[float, float]]] = {}
+    for r in load:
+        q = quality(records, r["label"])
+        chat, batch = gains(r, session_baseline(list(load), r))
+        if q is None or q["kl"] > goal.max_kl or chat is None or batch is None:
+            continue
+        scored[r["label"]] = (r | {"kl": q["kl"]}, (chat, batch))
+    if not scored:
+        return None
+    first = 0 if target == "chat" else 1
+
+    def tied(items: list[tuple[dict, tuple[float, float]]], i: int) -> list[tuple[dict, tuple[float, float]]]:
+        top = max(s[i] for _, s in items)
+        return [(r, s) for r, s in items if s[i] * (1 + LOAD_MIN_GAIN) >= top]
+
+    on_target = tied(list(scored.values()), first)
+    best = min(tied(on_target, 1 - first), key=lambda t: (t[0]["kl"], -t[1][first]))[0]
+    return best, [r for r, _ in on_target if r["label"] != best["label"]]
+
+
+def quality(records: list[dict], label: str) -> dict | None:
+    """The offline trial of label that measured its KL on the most tokens."""
+    ok = [r for r in records if r["label"] == label and r["status"] == "ok"]
+    confirmed = [r for r in ok if r["stage"] == "confirm"]
+    return next(iter(confirmed or ok), None)
+
+
+def _chat_batch(r: dict, load: list[dict]) -> str:
+    chat, batch = gains(r, session_baseline(load, r))
+    return (
+        f"chat {r['capacity_rps']:.2f} req/s ({_ratio(chat)} the baseline), "
+        f"batch {r['batch']['tput_tok_s']:,.0f} tok/s ({_ratio(batch)})"
+    )
+
+
+def _load_lines(best: dict, load: list[dict], target: str) -> list[str]:
+    base = session_baseline(load, best) or best
+    return [
+        (
+            f"`{best['label']}` for {target} traffic: {_chat_batch(best, load)}, against the baseline loaded "
+            f"in the same session ({base['capacity_rps']:.2f} req/s, {base['batch']['tput_tok_s']:,.0f} tok/s). "
+            f"KL {best['kl']:.4f}, KV cache {_f(best.get('kv_tokens'), ',')} tokens as the server reports them."
+        ),
+        "",
+    ]
+
+
+def _load_tie_lines(ties: list[dict], load: list[dict], target: str) -> list[str]:
+    if not ties:
+        return []
+    metric, other = ("chat capacity", "batch throughput") if target == "chat" else ("batch throughput", "chat capacity")
+    return [
+        "",
+        (
+            f"These configs are within {LOAD_MIN_GAIN:.0%} of it on {metric}, which the measurements do not "
+            f"separate; among them {other} within the same margin decided, then the lowest KL:"
+        ),
+        "",
+        *(f"- `{r['label']}`: {_chat_batch(r, load)}, KL {r['kl']:.4f}." for r in ties),
+    ]
+
+
+def _offline_lines(best: dict, b: dict) -> list[str]:
+    return [
+        (
+            f"`{best['label']}`: {best['tput_tok_s']:,.0f} tok/s, "
+            f"{best['tput_tok_s'] / b['tput_tok_s']:.2f}x the baseline ({b['tput_tok_s']:,.0f}). "
+            f"TPOT {best['tpot_ms']:.1f} ms (baseline {b['tpot_ms']:.1f}), "
+            f"TTFT {best['ttft_ms']:.0f} ms (baseline {b['ttft_ms']:.0f}), "
+            f"KV cache {best['kv_tokens']:,} tokens (baseline {b['kv_tokens']:,}). "
+            f"KL {best['kl']:.4f}, top-1 agreement {best['top1_agree']:.3f}, "
+            f"perplexity {best['ppl']:.3f} (baseline {b['ppl']:.3f})."
+        ),
+        "",
+        (
+            f"The baseline rerun scored KL {b['kl']:.4f} and top-1 agreement {b['top1_agree']:.3f} against its own "
+            f"reference, and its throughput varied {_f((b.get('tput_cv') or 0) * 100, '.1f')}% across repeats. "
+            "Differences smaller than these are noise."
+        ),
+    ]
+
+
+def _offline_tie_lines(records: list[dict], best: dict, goal: Goal) -> list[str]:
+    ties = near_ties(records, best, goal)
+    if not ties:
+        return []
+    worse = "lower throughput" if goal.target == "throughput" else "higher TPOT"
+    return [
+        "",
+        (
+            f"These configs trail `{best['label']}` by less than the noise, so the measurements do not "
+            "separate them from it; choose among them on quality and memory:"
+        ),
+        "",
+        *(
+            (
+                f"- `{r['label']}`: {gap * 100:.1f}% {worse}, noise {noise * 100:.1f}%. "
+                f"KL {r['kl']:.4f} (winner {best['kl']:.4f}), TPOT {r['tpot_ms']:.1f} ms "
+                f"(winner {best['tpot_ms']:.1f}), KV cache {r['kv_tokens']:,} tokens "
+                f"(winner {best['kv_tokens']:,})."
+            )
+            for r, gap, noise in ties
+        ),
+    ]
+
+
+def _commands(cand: Candidate, ctx: Context, run_dir: Path) -> list[str]:
+    env_vars = [f"{k}={v}" for k, v in serve_env(ctx.host.get("nvcc", False)).items()]
+    lines = [
+        "Start it with the environment the trials ran in:",
+        "",
+        "```",
+        f"dyno serve {run_dir}",
+        "```",
+        "",
+        "or directly:",
+        "",
+        "```",
+        " ".join([*env_vars, serve_command(cand, ctx)]),
+        "```",
+    ]
+    if ctx.host.get("unsearchable_path"):
+        lines += [
+            "",
+            (
+                f"The trials ran with {ctx.host['unsearchable_path']} PATH entries removed that Linux cannot "
+                "search (WSL adds Windows directories). With them in PATH, torch fails while probing for nvcc; "
+                "`dyno serve` removes them."
+            ),
+        ]
+    return lines
+
+
+def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] = (), load_goal: str = "chat") -> str:
     ctx = Context.from_json(meta["context"])
     goal = Goal(**meta["goal"])
     price = meta.get("gpu_price")
@@ -75,6 +228,8 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
     base_screen = next((r for r in records if r["stage"] == "screen" and r["label"] == "baseline"), None)
     base_confirm = next((r for r in records if r["stage"] == "confirm" and r["label"] == "baseline"), None)
     best = recommendation(records, goal)
+    under_load = load_recommendation(load, records, goal, load_goal)
+    picked, load_ties = under_load if under_load else (None, [])
 
     target = "highest throughput" if goal.target == "throughput" else "lowest time per output token"
     limits = [f"KL ≤ {goal.max_kl}"]
@@ -91,74 +246,27 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
             f"Started {meta['created']}."
         ),
         "",
-        f"Goal: {target} with {', '.join(limits)}. KL is measured against the baseline's next-token distribution.",
+        (
+            f"Goal: {_LOAD_TARGETS[load_goal]} with KL ≤ {goal.max_kl}; without load, {target} with {', '.join(limits)}."
+            if picked
+            else f"Goal: {target} with {', '.join(limits)}."
+        )
+        + " KL is measured against the baseline's next-token distribution.",
         "",
         "## Recommendation",
         "",
     ]
-    if best and base_confirm:
-        b = base_confirm
-        env_vars = [f"{k}={v}" for k, v in serve_env(ctx.host.get("nvcc", False)).items()]
-        lines += [
-            (
-                f"`{best['label']}`: {best['tput_tok_s']:,.0f} tok/s, "
-                f"{best['tput_tok_s'] / b['tput_tok_s']:.2f}x the baseline ({b['tput_tok_s']:,.0f}). "
-                f"TPOT {best['tpot_ms']:.1f} ms (baseline {b['tpot_ms']:.1f}), "
-                f"TTFT {best['ttft_ms']:.0f} ms (baseline {b['ttft_ms']:.0f}), "
-                f"KV cache {best['kv_tokens']:,} tokens (baseline {b['kv_tokens']:,}). "
-                f"KL {best['kl']:.4f}, top-1 agreement {best['top1_agree']:.3f}, "
-                f"perplexity {best['ppl']:.3f} (baseline {b['ppl']:.3f})."
-            ),
-            "",
-            "Start it with the environment the trials ran in:",
-            "",
-            "```",
-            f"dyno serve {run_dir}",
-            "```",
-            "",
-            "or directly:",
-            "",
-            "```",
-            " ".join([*env_vars, serve_command(candidate_of(best), ctx)]),
-            "```",
-            "",
-        ]
-        if ctx.host.get("unsearchable_path"):
-            lines += [
-                (
-                    f"The trials ran with {ctx.host['unsearchable_path']} PATH entries removed that Linux cannot "
-                    "search (WSL adds Windows directories). With them in PATH, torch fails while probing for nvcc; "
-                    "`dyno serve` removes them."
-                ),
-                "",
-            ]
-        lines += [
-            (
-                f"The baseline rerun scored KL {b['kl']:.4f} and top-1 agreement {b['top1_agree']:.3f} against its own "
-                f"reference, and its throughput varied {_f((b.get('tput_cv') or 0) * 100, '.1f')}% across repeats. "
-                "Differences smaller than these are noise."
-            ),
-        ]
-        ties = near_ties(records, best, goal)
-        if ties:
-            worse = "lower throughput" if goal.target == "throughput" else "higher TPOT"
-            lines += [
-                "",
-                (
-                    f"These configs trail `{best['label']}` by less than the noise, so the measurements do not "
-                    "separate them from it; choose among them on quality and memory:"
-                ),
-                "",
-            ]
-            lines += [
-                (
-                    f"- `{r['label']}`: {gap * 100:.1f}% {worse}, noise {noise * 100:.1f}%. "
-                    f"KL {r['kl']:.4f} (winner {best['kl']:.4f}), TPOT {r['tpot_ms']:.1f} ms "
-                    f"(winner {best['tpot_ms']:.1f}), KV cache {r['kv_tokens']:,} tokens "
-                    f"(winner {best['kv_tokens']:,})."
-                )
-                for r, gap, noise in ties
-            ]
+    if picked:
+        lines += _load_lines(picked, list(load), load_goal)
+        lines += _commands(candidate_of(picked), ctx, run_dir)
+        lines += _load_tie_lines(load_ties, list(load), load_goal)
+        if best and base_confirm:
+            lines += ["", "### Without load", "", *_offline_lines(best, base_confirm)]
+            lines += _offline_tie_lines(records, best, goal)
+    elif best and base_confirm:
+        offline = _offline_lines(best, base_confirm)
+        lines += [*offline[:2], *_commands(candidate_of(best), ctx, run_dir), "", *offline[2:]]
+        lines += _offline_tie_lines(records, best, goal)
     else:
         lines.append("No config finished the confirm stage within the goal.")
 
@@ -194,41 +302,45 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
                 f"{OUTPUT_LEN}-token answers arriving as a Poisson process; capacity is the highest rate at which "
                 f"{slo['share']:.0%} of requests had TTFT ≤ {slo['ttft_ms']:.0f} ms and TPOT ≤ {slo['tpot_ms']:.0f} ms, "
                 f"found to within {PRECISION:.0%}. Batch: {BATCH_REQUESTS} such requests at once. "
-                "KV tokens as the server reports them. Ratios are against the baseline measured at the start "
-                "of the same `dyno load`."
+                "Attention is the backend the server picked, and KV tokens the cache size it reports. Ratios "
+                "are against the baseline measured at the start of the same `dyno load`."
             ),
             "",
         ]
         rows = []
         for r in load:
+            q = quality(records, r["label"])
+            kl = _f(q["kl"] if q else None, ".4f")
             if r["status"] != "ok":
-                rows.append([f"`{r['label']}`", r["status"], "", "", "", "", "", "", ""])
+                rows.append([f"`{r['label']}`", "", r["status"], "", "", "", "", "", "", kl])
                 continue
             cap, chat, batch = r["capacity_rps"], r.get("chat") or {}, r["batch"]
             chat_x, batch_x = gains(r, session_baseline(list(load), r))
             rows.append(
                 [
                     f"`{r['label']}`",
+                    r.get("backend") or "",
                     f"< {MIN_RATE:g}" if cap is None else f"≥ {cap:g}" if r["capped"] else f"{cap:.2f}",
                     _ratio(chat_x),
                     _f(chat.get("ttft_p90_ms"), ".0f"),
                     _f(chat.get("tpot_p90_ms"), ".1f"),
                     f"{batch['tput_tok_s']:,.0f}",
                     _ratio(batch_x),
-                    _f(batch.get("tpot_p50_ms"), ".1f"),
                     _f(r.get("kv_tokens"), ","),
+                    kl,
                 ]
             )
         header = [
             "config",
+            "attention",
             "chat req/s",
             "vs baseline",
             "TTFT p90 ms",
             "TPOT p90 ms",
             "batch tok/s",
             "vs baseline",
-            "batch TPOT p50 ms",
             "KV tokens",
+            "KL",
         ]
         lines += _table(header, rows)
 
