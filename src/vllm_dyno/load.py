@@ -17,9 +17,11 @@ Every request carries its own cache_salt, so prompts from the pool can repeat wi
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
 offline engine's: below 70 GiB of GPU memory, max_num_batched_tokens is 2048 instead of 8192.
 
-Requests decode greedily without penalties, as the offline harness does, whatever the model's
-generation_config asks for. vLLM sizes its memory budget without penalty buffers; with 256
-requests running, Qwen2.5's repetition_penalty 1.1 took over 2 GiB more and overflowed an 8 GB GPU.
+Requests leave sampling to the server, which applies the model's generation_config as it would
+for any client that sets nothing. Qwen2.5 asks for temperature 0.7, top-k 20, top-p 0.8 and
+repetition_penalty 1.1. On an RTX 3070 they cost GPTQ-Int8 weights with TRITON_ATTN 8% of their
+chat capacity and 6 to 7% of batch throughput against greedy decoding. Under WSL the penalty
+overflows GPU memory unless torch's allocator uses expandable segments, which probe.serve_env sets.
 
 Each `dyno load` is a session that measures the baseline first, and gains are against the
 baseline of the same session: on an RTX 3070 the baseline's chat capacity was 17.45 req/s one
@@ -77,6 +79,7 @@ PRECISION = 0.05  # bisection stops once the passing and failing rates are this 
 MIN_PROBE_REQUESTS = 20
 KV_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
 BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:attention )?backend")
+SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`: `(\{.*?\})`")
 # chat capacity comes in steps of 4 to 9% (17.45, 19.03, 20.75 req/s near 18),
 # and one config landed a step apart in two runs 15 minutes apart
 LOAD_MIN_GAIN = 0.1
@@ -134,8 +137,6 @@ async def stream_one(client: httpx.AsyncClient, model: str, prompt: list[int], m
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": 0,
-        "repetition_penalty": 1.0,
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -480,6 +481,7 @@ def measure_config(
         with serving(shlex.split(serve_command(cand, ctx)), log_path, env, timeout_s) as url:
             started_log = log_path.read_text(errors="replace")
             kv, backends = KV_LINE.search(started_log), attention_backends(started_log)
+            sampling = SAMPLING_LINE.search(started_log)
             asyncio.run(send(url, model, pool[:4], [0.0] * 4, 16))  # first requests pay one-off setup costs
 
             def passes(rate: float) -> bool:
@@ -535,6 +537,7 @@ def measure_config(
         "error": slowed,
         "kv_tokens": int(kv.group(1).replace(",", "")) if kv else None,
         "backend": backends,
+        "sampling": sampling.group(1) if sampling else None,  # None: vLLM's own defaults
         "capacity_rps": lo,
         "capped": hi is None,
         "chat": at_capacity,

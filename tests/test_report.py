@@ -186,3 +186,20 @@ def test_a_degraded_config_is_listed_with_its_error_and_not_recommended(ctx, tmp
     assert "| `kv_cache_dtype=int8_per_token_head` |  | degraded |" in text
     listed = f"- `kv_cache_dtype=int8_per_token_head`, load: degraded, {error} (`{load[-1]['dir']}/server.log`)"
     assert listed in text[text.index("## Skipped and failed") :]
+
+
+@pytest.mark.parametrize(
+    ("sampling", "note"),
+    [
+        (
+            {"sampling": "{'temperature': 0.7}"},
+            "Requests left sampling to the server, which applied the model's generation_config: `{'temperature': 0.7}`.",
+        ),
+        ({"sampling": None}, "Requests left sampling to the server, which used vLLM's defaults."),
+        ({}, "Requests decoded greedily without penalties."),
+    ],
+)
+def test_the_load_section_names_the_sampling_requests_used(ctx, tmp_path, sampling, note):
+    load, records = loaded_run(ctx)
+    text = render(meta(ctx), [*RECORDS, *records], tmp_path, [r | sampling for r in load], "chat")
+    assert note in text

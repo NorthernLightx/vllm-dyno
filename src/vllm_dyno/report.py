@@ -114,6 +114,14 @@ def quality(records: list[dict], label: str) -> dict | None:
     return next(iter(confirmed or ok), None)
 
 
+def _sampling_note(r: dict) -> str:
+    if "sampling" not in r:  # load records from before requests left sampling to the server
+        return "Requests decoded greedily without penalties."
+    if r["sampling"] is None:
+        return "Requests left sampling to the server, which used vLLM's defaults."
+    return f"Requests left sampling to the server, which applied the model's generation_config: `{r['sampling']}`."
+
+
 def _chat_batch(r: dict, load: list[dict]) -> str:
     chat, batch = gains(r, session_baseline(load, r))
     return (
@@ -302,6 +310,7 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
                 f"{OUTPUT_LEN}-token answers arriving as a Poisson process; capacity is the highest rate at which "
                 f"{slo['share']:.0%} of requests had TTFT ≤ {slo['ttft_ms']:.0f} ms and TPOT ≤ {slo['tpot_ms']:.0f} ms, "
                 f"found to within {PRECISION:.0%}. Batch: {BATCH_REQUESTS} such requests at once. "
+                f"{_sampling_note(load[0])} "
                 "Attention is the backend the server picked, and KV tokens the cache size it reports. Ratios "
                 "are against the baseline measured at the start of the same `dyno load`."
             ),

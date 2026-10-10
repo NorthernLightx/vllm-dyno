@@ -42,7 +42,7 @@ def run_send(handler, prompts, slo=None, watch_server=False):
     )
 
 
-def test_requests_send_token_ids_each_with_its_own_cache_salt():
+def test_requests_send_token_ids_each_with_its_own_cache_salt_and_leave_sampling_to_the_server():
     bodies = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -52,8 +52,8 @@ def test_requests_send_token_ids_each_with_its_own_cache_salt():
     timings = run_send(handler, [[1, 2, 3], [4, 5, 6]]).timings
     assert [(t.tokens, t.error) for t in timings] == [(8, None), (8, None)]
     assert sorted(b["prompt"] for b in bodies) == [[1, 2, 3], [4, 5, 6]]
-    assert all(b["ignore_eos"] and b["stream"] and b["temperature"] == 0 for b in bodies)
-    assert all(b["repetition_penalty"] == 1 for b in bodies)
+    assert all(b["ignore_eos"] and b["stream"] for b in bodies)
+    assert not {"temperature", "top_k", "top_p", "repetition_penalty"} & {k for b in bodies for k in b}
     assert bodies[0]["cache_salt"] != bodies[1]["cache_salt"]
 
 
@@ -186,6 +186,18 @@ def test_targets_are_the_named_configs_from_any_stage():
 def test_the_server_log_names_the_attention_backends(lines, backends):
     log_text = "\n".join(f"(EngineCore pid=1) INFO 10-10 15:49:51 [cuda.py:526] {line}" for line in lines)
     assert load.attention_backends(log_text) == backends
+
+
+def test_the_server_log_names_the_sampling_defaults_from_generation_config():
+    line = (
+        "(APIServer pid=527) WARNING 10-10 23:17:15 [model.py:1850] Default vLLM sampling parameters have been "
+        "overridden by the model's `generation_config.json`: `{'repetition_penalty': 1.1, 'temperature': 0.7, "
+        "'top_k': 20, 'top_p': 0.8}`. If this is not intended, please relaunch vLLM instance with "
+        "`--generation-config vllm`."
+    )
+    found = load.SAMPLING_LINE.search(line)
+    assert found and found.group(1) == "{'repetition_penalty': 1.1, 'temperature': 0.7, 'top_k': 20, 'top_p': 0.8}"
+    assert load.SAMPLING_LINE.search("Starting vLLM API server") is None
 
 
 def test_watching_the_server_reports_peak_kv_usage_and_new_preemptions():
