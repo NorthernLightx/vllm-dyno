@@ -54,10 +54,10 @@ def test_report_names_the_winner_its_command_and_the_skips(ctx, tmp_path):
     text = render(meta(ctx), RECORDS, tmp_path)
     assert "`weights=fp8`: 1,190 tok/s, 1.18x the baseline" in text
     assert f"dyno serve {tmp_path}" in text
-    # no nvcc on the test host: the direct command carries the sampler switch
+    # WSL without nvcc on the test host: the direct command carries the sampler switch and the allocator setting
     assert (
-        "VLLM_USE_FLASHINFER_SAMPLER=0 vllm serve org/base --gpu-memory-utilization 0.63 --max-model-len 2048 "
-        "--quantization fp8" in text
+        "VLLM_USE_FLASHINFER_SAMPLER=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True vllm serve org/base "
+        "--gpu-memory-utilization 0.63 --max-model-len 2048 --quantization fp8" in text
     )
     assert "`kv_cache_dtype=fp8`, screen: skipped, no kernel" in text
 

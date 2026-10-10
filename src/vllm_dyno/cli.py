@@ -117,7 +117,7 @@ def _prepare(run, ctx, args) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     from .load import load_goal, load_records
-    from .probe import child_env
+    from .probe import child_env, measured_env
     from .report import recommendation, render
     from .runner import HARNESS_SHA, Run
     from .search import Goal, Searcher
@@ -139,6 +139,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         if meta["harness_sha"] != HARNESS_SHA:
             raise SystemExit(f"the measurement code changed since {out} started; start a new run")
         ctx, goal = Context.from_json(meta["context"]), Goal(**meta["goal"])
+        env = child_env(ctx.host)
+        if meta.get("env") != measured_env(env, ctx.host):
+            raise SystemExit(
+                f"{out} was measured with {meta.get('env')} and vLLM would now run with "
+                f"{measured_env(env, ctx.host)}; start a new run"
+            )
         log.info("resume   %s, %d trials recorded", out, len(run.records))
     else:
         from .probe import package_version
@@ -146,6 +152,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         if package_version("vllm") is None:
             raise SystemExit("vLLM is not installed; install vllm-dyno[vllm] or run `uv sync --extra vllm`")
         ctx = _build_context(args)
+        env = child_env(ctx.host)
         goal = Goal(args.goal, args.max_kl, args.max_ttft_ms, args.max_tpot_ms)
         _log_plan(ctx)
         meta = {
@@ -155,13 +162,14 @@ def cmd_run(args: argparse.Namespace) -> None:
             "goal": asdict(goal),
             "gpu_price": args.gpu_price,
             "harness_sha": HARNESS_SHA,
+            "env": measured_env(env, ctx.host),
             "free_mib_at_start": ctx.gpu.free_mib,
             "text": str(args.text) if args.text else "WikiText-2",
         }
         run.write_meta(meta)
         _prepare(run, ctx, args)
 
-    searcher = Searcher(run, ctx, goal, env=child_env(ctx.host["nvcc"]), timeout_s=args.trial_timeout)
+    searcher = Searcher(run, ctx, goal, env=env, timeout_s=args.trial_timeout)
     searcher.search(confirm_top=args.confirm_top, max_combos=args.max_combos)
     (out / "report.md").write_text(render(run.meta, run.records, out, load_records(out), load_goal(out)))
     best = recommendation(run.records, goal)
@@ -173,7 +181,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
-    from .probe import child_env, query_gpu
+    from .probe import child_env, measured_env, query_gpu
     from .report import render
     from .runner import HARNESS_SHA, Run
     from .search import Goal
@@ -189,8 +197,14 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
     _setup_logging(args.run_dir / "dyno.log")
     ctx = Context.from_json(run.meta["context"])
+    env = child_env(ctx.host)
     slo = Slo(args.slo_ttft_ms, args.slo_tpot_ms, args.slo_share)
-    settings = {"slo": asdict(slo), "probe_s": args.probe_seconds, "load_sha": LOAD_SHA}
+    settings = {
+        "slo": asdict(slo),
+        "probe_s": args.probe_seconds,
+        "load_sha": LOAD_SHA,
+        "env": measured_env(env, ctx.host),
+    }
     meta_path = args.run_dir / "load.json"
     gpu = query_gpu()
     free_mib = gpu.free_mib
@@ -198,7 +212,7 @@ def cmd_load(args: argparse.Namespace) -> None:
         meta = json.loads(meta_path.read_text())
         if {k: meta.get(k) for k in settings} != settings:
             raise SystemExit(
-                f"{meta_path} was measured with other SLO settings or load code; "
+                f"{meta_path} was measured with other SLO settings, environment or load code; "
                 "delete load.json and load.jsonl to measure again"
             )
         free_mib = meta["free_mib_at_start"]
@@ -212,9 +226,7 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
 
     pool = prompt_pool(json.loads((args.run_dir / "data.json").read_text()))
-    session = LoadSession(
-        run, ctx, pool, slo, args.probe_seconds, child_env(ctx.host["nvcc"]), args.server_timeout, free_mib
-    )
+    session = LoadSession(run, ctx, pool, slo, args.probe_seconds, env, args.server_timeout, free_mib)
     if args.config:
         session.baseline()
         for r in targets(run.records, args.config):
@@ -257,7 +269,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         raise SystemExit(f"{args.run_dir} has no recommendation; run `dyno run` to completion first")
     argv = shlex.split(serve_command(candidate_of(best), Context.from_json(run.meta["context"]))) + args.vllm_args
     print(shlex.join(argv), file=sys.stderr)
-    os.execvpe(argv[0], argv, child_env(host_facts()["nvcc"]))
+    os.execvpe(argv[0], argv, child_env(host_facts()))
 
 
 def main(argv: list[str] | None = None) -> None:
