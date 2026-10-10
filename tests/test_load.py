@@ -137,16 +137,26 @@ def test_targets_are_the_named_configs_from_any_stage():
 
 
 @pytest.mark.parametrize(
-    ("line", "backend"),
+    ("lines", "backends"),
     [
-        ("Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'TRITON_ATTN'].", "FLASH_ATTN"),
-        ("Using AttentionBackendEnum.TRITON_ATTN backend.", "TRITON_ATTN"),
-        ("Using TURBOQUANT attention backend out of potential backends: ['TURBOQUANT'].", "TURBOQUANT"),
+        (
+            ["Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'TRITON_ATTN']."],
+            "FLASH_ATTN",
+        ),
+        (["Using AttentionBackendEnum.TRITON_ATTN backend."], "TRITON_ATTN"),
+        (
+            [
+                "Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'TRITON_ATTN'].",
+                "Using TURBOQUANT attention backend out of potential backends: ['TURBOQUANT'].",
+            ],
+            "FLASH_ATTN+TURBOQUANT",
+        ),
+        (["Starting vLLM API server"], None),
     ],
 )
-def test_the_server_log_names_the_attention_backend(line, backend):
-    match = load.BACKEND_LINE.search(f"INFO 10-10 01:07:11 [cuda.py:526] {line}")
-    assert match and match.group(1) == backend
+def test_the_server_log_names_the_attention_backends(lines, backends):
+    log_text = "\n".join(f"(EngineCore pid=1) INFO 10-10 15:49:51 [cuda.py:526] {line}" for line in lines)
+    assert load.attention_backends(log_text) == backends
 
 
 def test_watching_the_server_reports_peak_kv_usage_and_new_preemptions():

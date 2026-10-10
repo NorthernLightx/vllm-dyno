@@ -389,6 +389,14 @@ def targets(records: list[dict], labels: list[str]) -> list[dict]:
     return out
 
 
+def attention_backends(log_text: str) -> str | None:
+    """The attention backends a server log says it picked, in order, joined by "+".
+
+    turboquant KV keeps some layers on FLASH_ATTN, so its server names two.
+    """
+    return "+".join(dict.fromkeys(BACKEND_LINE.findall(log_text))) or None
+
+
 def load_goal(run_dir: Path) -> str:
     """The traffic profile, "chat" or "batch", that the last `dyno load` of the run recommends a config for."""
     path = run_dir / "load.json"
@@ -424,7 +432,7 @@ def measure_config(
     try:
         with serving(shlex.split(serve_command(cand, ctx)), log_path, env, timeout_s) as url:
             started_log = log_path.read_text(errors="replace")
-            kv, backend = KV_LINE.search(started_log), BACKEND_LINE.search(started_log)
+            kv, backends = KV_LINE.search(started_log), attention_backends(started_log)
             asyncio.run(send(url, model, pool[:4], [0.0] * 4, 16))  # first requests pay one-off setup costs
 
             def passes(rate: float) -> bool:
@@ -467,7 +475,7 @@ def measure_config(
         "status": "ok",
         "error": None,
         "kv_tokens": int(kv.group(1).replace(",", "")) if kv else None,
-        "backend": backend.group(1) if backend else None,
+        "backend": backends,
         "capacity_rps": lo,
         "capped": hi is None,
         "chat": at_capacity,
