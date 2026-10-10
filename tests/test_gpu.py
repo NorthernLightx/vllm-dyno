@@ -31,7 +31,7 @@ def test_baseline_writes_a_reference_and_a_rerun_matches_it(tmp_path):
     run.write_meta({"free_mib_at_start": ctx.gpu.free_mib})
     built = data.build(MODEL, ctx.revision, None, SCREEN["eval_tokens"], POOL_SIZE)
     (tmp_path / "data.json").write_text(json.dumps(built))
-    env = child_env(ctx.host)
+    env = child_env(ctx.host, server=False)
 
     base = run_trial(run, ctx, "screen", Candidate(), SCREEN, write_reference=True, env=env, timeout_s=900)
     assert base["status"] == "ok", base.get("error")
@@ -50,7 +50,7 @@ def test_vllm_serve_answers_requests_a_chat_probe_and_a_batch(tmp_path):
     pool = prompt_pool(data.build(MODEL, ctx.revision, None, SCREEN["eval_tokens"], POOL_SIZE))
     model = engine_args(Candidate(), ctx)["model"]
     log_path = tmp_path / "server.log"
-    with serving(shlex.split(serve_command(Candidate(), ctx)), log_path, child_env(ctx.host), 600) as url:
+    with serving(shlex.split(serve_command(Candidate(), ctx)), log_path, child_env(ctx.host, server=True), 600) as url:
         assert KV_LINE.search(log_path.read_text())
         sent = asyncio.run(send(url, model, pool[:2], [0.0, 0.0], OUTPUT_LEN))
         probe = chat_probe(url, model, pool, 2.0, Slo(), 5)

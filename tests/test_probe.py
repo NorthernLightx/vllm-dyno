@@ -17,21 +17,22 @@ def test_memory_utilization_is_capped():
 def test_child_env_drops_unsearchable_path_entries_and_disables_flashinfer_sampler(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path), "/no/such/dir"]))
     monkeypatch.delenv("VLLM_USE_FLASHINFER_SAMPLER", raising=False)
-    env = child_env({"nvcc": False, "wsl": False})
+    env = child_env({"nvcc": False, "wsl": False}, server=False)
     assert env["PATH"] == str(tmp_path)
     assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
-    assert "VLLM_USE_FLASHINFER_SAMPLER" not in child_env({"nvcc": True, "wsl": False})
+    assert "VLLM_USE_FLASHINFER_SAMPLER" not in child_env({"nvcc": True, "wsl": False}, server=False)
 
 
-def test_under_wsl_the_allocator_grows_segments_and_the_user_setting_wins(monkeypatch):
+def test_servers_under_wsl_grow_allocator_segments_and_the_user_setting_wins(monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     wsl, linux = {"nvcc": True, "wsl": True}, {"nvcc": True, "wsl": False}
-    assert child_env(wsl)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert "PYTORCH_CUDA_ALLOC_CONF" not in child_env(linux)
+    assert child_env(wsl, server=True)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in child_env(wsl, server=False)
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in child_env(linux, server=True)
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
-    env = child_env(wsl)
-    assert measured_env(env, wsl) == {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"}
-    assert measured_env(env, linux) == {}
+    env = child_env(wsl, server=True)
+    assert measured_env(env, wsl, server=True) == {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"}
+    assert measured_env(env, wsl, server=False) == measured_env(env, linux, server=True) == {}
 
 
 def test_kv_bytes_per_token_for_qwen2_5_1_5b():

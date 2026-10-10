@@ -139,11 +139,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         if meta["harness_sha"] != HARNESS_SHA:
             raise SystemExit(f"the measurement code changed since {out} started; start a new run")
         ctx, goal = Context.from_json(meta["context"]), Goal(**meta["goal"])
-        env = child_env(ctx.host)
-        if meta.get("env") != measured_env(env, ctx.host):
+        env = child_env(ctx.host, server=False)
+        if meta.get("env") != measured_env(env, ctx.host, server=False):
             raise SystemExit(
                 f"{out} was measured with {meta.get('env')} and vLLM would now run with "
-                f"{measured_env(env, ctx.host)}; start a new run"
+                f"{measured_env(env, ctx.host, server=False)}; start a new run"
             )
         log.info("resume   %s, %d trials recorded", out, len(run.records))
     else:
@@ -152,7 +152,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         if package_version("vllm") is None:
             raise SystemExit("vLLM is not installed; install vllm-dyno[vllm] or run `uv sync --extra vllm`")
         ctx = _build_context(args)
-        env = child_env(ctx.host)
+        env = child_env(ctx.host, server=False)
         goal = Goal(args.goal, args.max_kl, args.max_ttft_ms, args.max_tpot_ms)
         _log_plan(ctx)
         meta = {
@@ -162,7 +162,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             "goal": asdict(goal),
             "gpu_price": args.gpu_price,
             "harness_sha": HARNESS_SHA,
-            "env": measured_env(env, ctx.host),
+            "env": measured_env(env, ctx.host, server=False),
             "free_mib_at_start": ctx.gpu.free_mib,
             "text": str(args.text) if args.text else "WikiText-2",
         }
@@ -179,6 +179,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     log.info("report   %s", out / "report.md")
 
 
+def _trial_env(meta: dict) -> dict[str, str | None]:
+    from .probe import child_env, measured_env
+
+    host = meta["context"]["host"]
+    return measured_env(child_env(host, server=False), host, server=False)
+
+
 def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
     from .probe import child_env, measured_env, query_gpu
@@ -190,20 +197,20 @@ def cmd_load(args: argparse.Namespace) -> None:
     run = Run(args.run_dir)
     if not (args.run_dir / "run.json").exists():
         raise SystemExit(f"{args.run_dir} is not a run directory")
-    if not args.config and run.meta["harness_sha"] != HARNESS_SHA:
+    if not args.config and (run.meta["harness_sha"] != HARNESS_SHA or run.meta.get("env") != _trial_env(run.meta)):
         raise SystemExit(
-            f"the offline measurement code changed since {args.run_dir} started, and combinations need "
-            "quality trials comparable with its others; start a new run, or name configs with --config"
+            f"the offline measurement code or environment changed since {args.run_dir} started, and combinations "
+            "need quality trials comparable with its others; start a new run, or name configs with --config"
         )
     _setup_logging(args.run_dir / "dyno.log")
     ctx = Context.from_json(run.meta["context"])
-    env = child_env(ctx.host)
+    env = child_env(ctx.host, server=True)
     slo = Slo(args.slo_ttft_ms, args.slo_tpot_ms, args.slo_share)
     settings = {
         "slo": asdict(slo),
         "probe_s": args.probe_seconds,
         "load_sha": LOAD_SHA,
-        "env": measured_env(env, ctx.host),
+        "env": measured_env(env, ctx.host, server=True),
     }
     meta_path = args.run_dir / "load.json"
     gpu = query_gpu()
@@ -269,7 +276,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         raise SystemExit(f"{args.run_dir} has no recommendation; run `dyno run` to completion first")
     argv = shlex.split(serve_command(candidate_of(best), Context.from_json(run.meta["context"]))) + args.vllm_args
     print(shlex.join(argv), file=sys.stderr)
-    os.execvpe(argv[0], argv, child_env(host_facts()))
+    os.execvpe(argv[0], argv, child_env(host_facts(), server=True))
 
 
 def main(argv: list[str] | None = None) -> None:

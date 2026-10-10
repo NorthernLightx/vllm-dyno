@@ -71,34 +71,40 @@ def host_facts() -> dict:
     }
 
 
-def serve_env(host: dict) -> dict[str, str]:
-    """Variables vLLM needs on this host, given its host_facts(), beyond the user's environment."""
+def serve_env(host: dict, *, server: bool) -> dict[str, str]:
+    """Variables vLLM needs on this host, given its host_facts(), beyond the user's environment.
+
+    server is True for `vllm serve` and False for the offline engine of trials.
+    """
     env = {}
     if not host.get("nvcc"):
         env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"  # its top-k/top-p sampler JIT-compiles with nvcc
-    if host.get("wsl"):
+    if host.get("wsl") and server:
         # Under WSL cudaMalloc spills into system memory instead of failing, and only a failure
         # makes torch's caching allocator release cached blocks. vLLM copies the logits to fp32 at
         # the batch's size whenever a request needs logits processing such as a repetition penalty;
         # as 256 requests ramped up, each slightly larger copy took a new segment, 2.1 GiB in all.
+        # Trials keep the default allocator: with expandable segments the offline engine's profile
+        # run at max_num_batched_tokens 8192 failed with "CUDA driver error: device not ready",
+        # while servers here run 2048 tokens per step, and trials decode greedily without penalties.
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     return env
 
 
-def child_env(host: dict) -> dict[str, str]:
-    """Environment for trial processes and `dyno serve` on a host described by host_facts()."""
+def child_env(host: dict, *, server: bool) -> dict[str, str]:
+    """Environment for trial processes (server False) and `vllm serve` (server True) on a host from host_facts()."""
     env = dict(os.environ)
     # WSL appends Windows dirs to PATH. Exec into one Linux cannot search fails with EACCES,
     # and torch inductor's `nvcc --version` probe only handles ENOENT.
     env["PATH"] = os.pathsep.join(d for d in env.get("PATH", "").split(os.pathsep) if _searchable(d))
-    for key, value in serve_env(host).items():
+    for key, value in serve_env(host, server=server).items():
         env.setdefault(key, value)
     return env
 
 
-def measured_env(env: dict[str, str], host: dict) -> dict[str, str | None]:
+def measured_env(env: dict[str, str], host: dict, *, server: bool) -> dict[str, str | None]:
     """The values in env of the variables serve_env() sets, which measurements depend on."""
-    return {key: env.get(key) for key in serve_env(host)}
+    return {key: env.get(key) for key in serve_env(host, server=server)}
 
 
 @dataclass(frozen=True)

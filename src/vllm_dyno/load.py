@@ -21,7 +21,8 @@ Requests leave sampling to the server, which applies the model's generation_conf
 for any client that sets nothing. Qwen2.5 asks for temperature 0.7, top-k 20, top-p 0.8 and
 repetition_penalty 1.1. On an RTX 3070 they cost GPTQ-Int8 weights with TRITON_ATTN 8% of their
 chat capacity and 6 to 7% of batch throughput against greedy decoding. Under WSL the penalty
-overflows GPU memory unless torch's allocator uses expandable segments, which probe.serve_env sets.
+overflows GPU memory unless torch's allocator uses expandable segments, which probe.serve_env sets
+for servers.
 
 Each `dyno load` is a session that measures the baseline first, and gains are against the
 baseline of the same session: on an RTX 3070 the baseline's chat capacity was 17.45 req/s one
@@ -61,6 +62,7 @@ from pathlib import Path
 
 import httpx
 
+from .probe import child_env
 from .runner import Run, classify, kill_group, slug, wait_for_gpu
 from .search import SCREEN, Goal, Searcher, candidate_of, combinations
 from .space import KNOBS, Context, engine_args, serve_command
@@ -651,7 +653,8 @@ class LoadSession:
         if not combos:
             log.info("load     fewer than two settings gained %.0f%%; nothing to combine", LOAD_MIN_GAIN * 100)
             return
-        quality = Searcher(self.run, self.ctx, goal, self.env, trial_timeout_s).stage("combine", combos, SCREEN)
+        trial_env = child_env(self.ctx.host, server=False)
+        quality = Searcher(self.run, self.ctx, goal, trial_env, trial_timeout_s).stage("combine", combos, SCREEN)
         for r in quality:
             if r["status"] != "ok" or r["kl"] > goal.max_kl:
                 continue
