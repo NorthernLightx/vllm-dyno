@@ -175,12 +175,18 @@ def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_records, prompt_pool, targets
     from .probe import child_env, query_gpu
     from .report import render
-    from .runner import Run
+    from .runner import HARNESS_SHA, Run
+    from .search import Goal
     from .space import Context
 
     run = Run(args.run_dir)
     if not (args.run_dir / "run.json").exists():
         raise SystemExit(f"{args.run_dir} is not a run directory")
+    if not args.config and run.meta["harness_sha"] != HARNESS_SHA:
+        raise SystemExit(
+            f"the offline measurement code changed since {args.run_dir} started, and combinations need "
+            "quality trials comparable with its others; start a new run, or name configs with --config"
+        )
     _setup_logging(args.run_dir / "dyno.log")
     ctx = Context.from_json(run.meta["context"])
     slo = Slo(args.slo_ttft_ms, args.slo_tpot_ms, args.slo_share)
@@ -209,10 +215,13 @@ def cmd_load(args: argparse.Namespace) -> None:
     session = LoadSession(
         run, ctx, pool, slo, args.probe_seconds, child_env(ctx.host["nvcc"]), args.server_timeout, free_mib
     )
-    session.baseline()
-    for r in targets(run.records, args.config):
-        if r["label"] != "baseline":
-            session.measure(r)
+    if args.config:
+        session.baseline()
+        for r in targets(run.records, args.config):
+            if r["label"] != "baseline":
+                session.measure(r)
+    else:
+        session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
     (args.run_dir / "report.md").write_text(render(run.meta, run.records, args.run_dir, load_records(args.run_dir)))
     log.info("report   %s", args.run_dir / "report.md")
 
@@ -287,13 +296,19 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--dry-run", action="store_true", help="print the plan without loading any model on the GPU")
     run.set_defaults(func=cmd_run)
 
-    load = sub.add_parser("load", help="measure a run's confirmed configs under online load through vllm serve")
+    load = sub.add_parser(
+        "load", help="measure a run's settings and their combinations under online load through vllm serve"
+    )
     load.add_argument("run_dir", type=Path)
     load.add_argument(
         "--config",
         action="append",
         default=[],
-        help="trial label to load instead of the confirmed configs (repeatable)",
+        help="trial label to load instead of searching (repeatable); the baseline is always loaded",
+    )
+    load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
+    load.add_argument(
+        "--trial-timeout", type=float, default=900, help="seconds before a combination's quality trial is killed"
     )
     load.add_argument("--slo-ttft-ms", type=float, default=1000, help="time to first token a request may take")
     load.add_argument("--slo-tpot-ms", type=float, default=50, help="time per output token a request may take")

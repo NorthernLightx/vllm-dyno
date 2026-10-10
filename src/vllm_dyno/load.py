@@ -4,7 +4,13 @@ chat   256-token prompts with 128-token answers arriving as a Poisson process. C
        highest request rate at which the SLO share of requests meet both the TTFT and the TPOT
        limit, found by doubling the rate and then bisecting.
 batch  512 such requests at once, more tokens than any config's KV cache holds, so the cache
-       decides how many run together. Reports output tokens/s.
+       or max_num_seqs decides how many run together. Reports output tokens/s.
+
+The search loads every setting the offline run kept within the quality limit, then combines
+those that gained under load. The offline screen cannot be the filter. On an RTX 3070,
+TRITON_ATTN matched FLASH_ATTN offline but served 24% more chat traffic, because FlashAttention 2
+ran a batch of decodes three to six times slower once a prefill joined it; the offline test
+prefills everything up front.
 
 Every request carries its own cache_salt, so prompts from the pool can repeat without prefix
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
@@ -36,6 +42,7 @@ import re
 import shlex
 import socket
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Callable, Generator
@@ -45,8 +52,8 @@ from pathlib import Path
 import httpx
 
 from .runner import Run, classify, kill_group, slug, wait_for_gpu
-from .search import candidate_of
-from .space import Context, engine_args, serve_command
+from .search import SCREEN, Goal, Searcher, candidate_of, combinations
+from .space import KNOBS, Context, engine_args, serve_command
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +68,10 @@ MAX_RATE = 256.0
 PRECISION = 0.05  # bisection stops once the passing and failing rates are this close
 MIN_PROBE_REQUESTS = 20
 KV_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
+BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:attention )?backend")
+# chat capacity comes in steps of 4 to 9% (17.45, 19.03, 20.75 req/s near 18),
+# and one config landed a step apart in two runs 15 minutes apart
+LOAD_MIN_GAIN = 0.1
 QUEUE = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
 KV_USAGE = {"vllm:kv_cache_usage_perc"}
 PREEMPTIONS = {"vllm:num_preemptions_total"}
@@ -368,9 +379,7 @@ def serving(argv: list[str], log_path: Path, env: dict[str, str], timeout_s: flo
 
 
 def targets(records: list[dict], labels: list[str]) -> list[dict]:
-    """Trial records to load: the named configs, or every config that finished the confirm stage."""
-    if not labels:
-        return [r for r in records if r["stage"] == "confirm" and r["status"] == "ok"]
+    """The trial record of each named config."""
     out = []
     for label in labels:
         r = next((r for r in records if r["label"] == label and r["status"] == "ok"), None)
@@ -408,7 +417,8 @@ def measure_config(
     probes: list[dict] = []
     try:
         with serving(shlex.split(serve_command(cand, ctx)), log_path, env, timeout_s) as url:
-            kv = KV_LINE.search(log_path.read_text(errors="replace"))
+            started_log = log_path.read_text(errors="replace")
+            kv, backend = KV_LINE.search(started_log), BACKEND_LINE.search(started_log)
             asyncio.run(send(url, model, pool[:4], [0.0] * 4, 16))  # first requests pay one-off setup costs
 
             def passes(rate: float) -> bool:
@@ -451,6 +461,7 @@ def measure_config(
         "status": "ok",
         "error": None,
         "kv_tokens": int(kv.group(1).replace(",", "")) if kv else None,
+        "backend": backend.group(1) if backend else None,
         "capacity_rps": lo,
         "capped": hi is None,
         "chat": at_capacity,
@@ -471,6 +482,18 @@ def gains(r: dict, base: dict | None) -> tuple[float | None, float | None]:
         return None, None
     chat = (r["capacity_rps"] or 0.0) / base["capacity_rps"] if base["capacity_rps"] else None
     return chat, r["batch"]["tput_tok_s"] / base["batch"]["tput_tok_s"]
+
+
+def promising_under_load(load: list[dict], min_gain: float) -> dict[str, dict[str, float]]:
+    """Per setting, the values that on their own beat their session baseline by min_gain on chat or batch."""
+    out: dict[str, dict[str, float]] = {k: {} for k in KNOBS}
+    for r in load:
+        changes = candidate_of(r).changes()
+        best = max((g for g in gains(r, session_baseline(load, r)) if g is not None), default=0.0)
+        if len(changes) == 1 and best >= 1 + min_gain:
+            knob, value = next(iter(changes.items()))
+            out[knob][value] = best
+    return out
 
 
 @dataclass(frozen=True)
@@ -526,3 +549,36 @@ class LoadSession:
             where = self.run.path / record["dir"]
             raise SystemExit(f"the baseline did not serve ({record['status']}: {record['error']}); see {where}")
         return record
+
+    def same_engine(self, r: dict) -> str | None:
+        """A loaded config that differs from r only in naming the attention backend its server picked anyway."""
+        cand = candidate_of(r)
+        if cand.attention_backend == "auto":
+            return None
+        auto = cand.replace(attention_backend="auto").label()
+        done = load_records(self.run.path)
+        if any(x["label"] == auto and x.get("backend") == cand.attention_backend for x in done):
+            return auto
+        return None
+
+    def search(self, goal: Goal, max_combos: int, trial_timeout_s: float) -> None:
+        """The baseline, every single setting within the quality limit, then combinations of those that gained."""
+        self.baseline()
+        for r in self.run.records:
+            single = r["stage"] == "screen" and len(candidate_of(r).changes()) == 1
+            if single and r["status"] == "ok" and r["kl"] <= goal.max_kl:
+                self.measure(r)
+        good = promising_under_load(load_records(self.run.path), LOAD_MIN_GAIN)
+        # pairs first, so a triple whose explicit backend changes nothing is seen to match a pair already loaded
+        combos = sorted(combinations(good, limit=sys.maxsize), key=lambda c: len(c.changes()))[:max_combos]
+        if not combos:
+            log.info("load     fewer than two settings gained %.0f%%; nothing to combine", LOAD_MIN_GAIN * 100)
+            return
+        quality = Searcher(self.run, self.ctx, goal, self.env, trial_timeout_s).stage("combine", combos, SCREEN)
+        for r in quality:
+            if r["status"] != "ok" or r["kl"] > goal.max_kl:
+                continue
+            if same := self.same_engine(r):
+                log.info("load     %s runs the same engine as %s", r["label"], same)
+                continue
+            self.measure(r)

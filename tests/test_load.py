@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import asdict
 
 import httpx
 import pytest
@@ -14,11 +15,14 @@ from vllm_dyno.load import (
     load_records,
     metric,
     poisson_starts,
+    promising_under_load,
     quantile,
     send,
     targets,
 )
 from vllm_dyno.runner import Run
+from vllm_dyno.search import Goal
+from vllm_dyno.space import KNOBS, Candidate
 
 
 def completion(tokens: int) -> bytes:
@@ -121,17 +125,28 @@ def test_quantile_is_nearest_rank():
     assert quantile([], 0.9) is None
 
 
-def test_targets_default_to_confirmed_configs_and_take_named_ones_from_any_stage():
+def test_targets_are_the_named_configs_from_any_stage():
     records = [
         {"stage": "screen", "label": "baseline", "status": "ok"},
         {"stage": "screen", "label": "kv_cache_dtype=turboquant_k8v4", "status": "ok"},
         {"stage": "screen", "label": "kv_cache_dtype=fp8", "status": "skipped"},
-        {"stage": "confirm", "label": "baseline", "status": "ok"},
     ]
-    assert targets(records, []) == [records[3]]
     assert targets(records, ["kv_cache_dtype=turboquant_k8v4"]) == [records[1]]
     with pytest.raises(SystemExit):
         targets(records, ["kv_cache_dtype=fp8"])
+
+
+@pytest.mark.parametrize(
+    ("line", "backend"),
+    [
+        ("Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'TRITON_ATTN'].", "FLASH_ATTN"),
+        ("Using AttentionBackendEnum.TRITON_ATTN backend.", "TRITON_ATTN"),
+        ("Using TURBOQUANT attention backend out of potential backends: ['TURBOQUANT'].", "TURBOQUANT"),
+    ],
+)
+def test_the_server_log_names_the_attention_backend(line, backend):
+    match = load.BACKEND_LINE.search(f"INFO 10-10 01:07:11 [cuda.py:526] {line}")
+    assert match and match.group(1) == backend
 
 
 def test_watching_the_server_reports_peak_kv_usage_and_new_preemptions():
@@ -192,3 +207,88 @@ def test_a_baseline_that_does_not_serve_stops_the_session(tmp_path, monkeypatch,
     monkeypatch.setattr(load, "measure_config", lambda r, *a, **k: {"label": r["label"], "status": "oom", "error": "x"})
     with pytest.raises(SystemExit, match="the baseline did not serve"):
         s.baseline()
+
+
+def loaded(label: str, session: str, capacity: float, batch: float, backend: str = "FLASH_ATTN") -> dict:
+    cand = Candidate() if label == "baseline" else Candidate(**dict(kv.split("=") for kv in label.split()))
+    return {
+        "label": label,
+        **{k: getattr(cand, k) for k in KNOBS},
+        "status": "ok",
+        "session": session,
+        "capacity_rps": capacity,
+        "batch": {"tput_tok_s": batch},
+        "backend": backend,
+    }
+
+
+def test_settings_gain_against_their_own_session_on_chat_or_batch():
+    records = [
+        loaded("baseline", "night", 10, 1000),
+        loaded("attention_backend=TRITON_ATTN", "night", 12, 1000),  # chat +20%
+        loaded("baseline", "morning", 12, 1000),
+        loaded("weights=fp8", "morning", 12, 1150),  # batch +15%
+        loaded("kv_cache_dtype=turboquant_k8v4", "morning", 12.5, 1050),  # under 10% on both
+        loaded("weights=fp8 attention_backend=TRITON_ATTN", "morning", 20, 2000),  # a combination, not a setting
+    ]
+    good = promising_under_load(records, 0.1)
+    assert good["attention_backend"] == {"TRITON_ATTN": pytest.approx(1.2)}
+    assert good["weights"] == {"fp8": pytest.approx(1.15)}
+    assert good["kv_cache_dtype"] == {} and good["speculative"] == {}
+
+
+def trial(stage: str, label: str, kl: float, status: str = "ok") -> dict:
+    cand = Candidate() if label == "baseline" else Candidate(**dict(kv.split("=") for kv in label.split()))
+    return {"key": f"{stage}|{label}", "stage": stage, "label": label, "status": status, "kl": kl, **asdict(cand)}
+
+
+def test_search_loads_settings_within_quality_then_combines_those_that_gained(tmp_path, monkeypatch, ctx):
+    run = Run(tmp_path)
+    for r in [
+        trial("screen", "baseline", 0.0),
+        trial("screen", "weights=fp8", 0.007),
+        trial("screen", "weights=org/base-AWQ", 0.07),  # over the quality limit
+        trial("screen", "kv_cache_dtype=int8_per_token_head", 0.013),
+        trial("screen", "attention_backend=TRITON_ATTN", 0.0006),
+        trial("screen", "speculative=ngram", 0.0),
+        trial("screen", "kv_cache_dtype=fp8", 0.0, status="skipped"),
+    ]:
+        run.append(r)
+    results = {  # chat req/s, batch tok/s, attention backend the server picked
+        "baseline": (10, 1000, "FLASH_ATTN"),
+        "weights=fp8": (10, 1200, "FLASH_ATTN"),
+        "kv_cache_dtype=int8_per_token_head": (12, 1200, "TRITON_ATTN"),
+        "attention_backend=TRITON_ATTN": (12, 1000, "TRITON_ATTN"),
+        "speculative=ngram": (5, 600, "FLASH_ATTN"),
+    }
+    measured = []
+
+    def fake_measure(r, *args, **kwargs):
+        measured.append(r["label"])
+        cap, batch, backend = results.get(r["label"], (13, 1300, "TRITON_ATTN"))
+        return loaded(r["label"], "", cap, batch, backend)
+
+    class FakeSearcher:
+        def __init__(self, *args):
+            pass
+
+        def stage(self, stage, cands, tier):
+            # fp8 weights with int8 KV miss the quality limit, whatever backend is named
+            def kl(c: Candidate) -> float:
+                return 0.06 if c.weights == "fp8" and c.kv_cache_dtype == "int8_per_token_head" else 0.01
+
+            return [trial(stage, c.label(), kl(c)) for c in cands]
+
+    monkeypatch.setattr(load, "measure_config", fake_measure)
+    monkeypatch.setattr(load, "wait_for_gpu", lambda free_mib: None)
+    monkeypatch.setattr(load, "Searcher", FakeSearcher)
+    LoadSession(run, ctx, [[1]], Slo(), 30, {}, 600, 6000, id="s").search(Goal(), max_combos=8, trial_timeout_s=900)
+    assert measured == [
+        "baseline",
+        "weights=fp8",
+        "kv_cache_dtype=int8_per_token_head",
+        "attention_backend=TRITON_ATTN",
+        "speculative=ngram",
+        # int8 KV already ran TRITON_ATTN, so naming it again is not loaded
+        "weights=fp8 attention_backend=TRITON_ATTN",
+    ]
