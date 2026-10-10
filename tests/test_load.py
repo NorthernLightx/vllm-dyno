@@ -110,6 +110,33 @@ def test_capacity_reports_the_ends_of_the_range():
     assert find_capacity(lambda rate: True) == (load.MAX_RATE, None)
 
 
+@pytest.mark.parametrize("stall", [load.START_RATE, load.START_RATE * 2, 16.0])
+def test_one_failure_that_does_not_repeat_does_not_cap_the_capacity(stall):
+    rates = []
+
+    def passes(rate: float) -> bool:
+        rates.append(rate)
+        return rate <= 20 and not (rate == stall and rates.count(rate) == 1)
+
+    lo, hi = find_capacity(passes)
+    assert lo is not None and hi is not None
+    assert lo <= 20 < hi and hi / lo <= 1 + load.PRECISION
+    assert rates.count(stall) == 2
+
+
+def test_the_lowest_failing_rate_is_probed_once_more_and_then_stands():
+    rates = []
+
+    def passes(rate: float) -> bool:
+        rates.append(rate)
+        return rate <= 7.3
+
+    lo, hi = find_capacity(passes)
+    assert (lo, hi) == pytest.approx(find_capacity(lambda rate: rate <= 7.3))
+    assert rates.count(hi) == 2
+    assert rates[-1] == hi
+
+
 def test_metrics_sum_the_named_series_only():
     metrics = """\
 # HELP vllm:num_requests_running Number of requests in model execution batches.

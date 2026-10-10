@@ -2,7 +2,8 @@
 
 chat   256-token prompts with 128-token answers arriving as a Poisson process. Capacity is the
        highest request rate at which the SLO share of requests meet both the TTFT and the TPOT
-       limit, found by doubling the rate and then bisecting.
+       limit, found by doubling the rate and then bisecting, with the lowest failing rate
+       probed twice.
 batch  512 such requests at once, more tokens than any config's KV cache holds, so the cache
        or max_num_seqs decides how many run together. Reports output tokens/s.
 
@@ -306,30 +307,55 @@ def find_capacity(passes: Callable[[float], bool]) -> tuple[float | None, float 
     """The highest rate found to pass and the lowest found to fail.
 
     Doubles from START_RATE until a rate fails, or halves until one passes, then bisects until
-    the two are within PRECISION. The passing rate is None if MIN_RATE fails; the failing one
+    the two are within PRECISION. The failing rate is then probed once more, and if it passes
+    the search goes on above it. The passing rate is None if MIN_RATE fails; the failing one
     is None if MAX_RATE passes.
     """
+    failed: list[float] = []
+
+    def probe(rate: float) -> bool:
+        if passes(rate):
+            return True
+        failed.append(rate)
+        return False
+
     lo: float | None = None
     hi: float | None = None
-    if passes(START_RATE):
-        lo = START_RATE
-        while lo * 2 <= MAX_RATE:
-            if not passes(lo * 2):
-                hi = lo * 2
-                break
-            lo *= 2
+    if probe(START_RATE):
+        lo, hi = _double(probe, START_RATE)
     else:
         hi = START_RATE
         while hi / 2 >= MIN_RATE:
-            if passes(hi / 2):
+            if probe(hi / 2):
                 lo = hi / 2
                 break
             hi /= 2
     if lo is None or hi is None:
         return lo, hi
+    lo, hi = _bisect(probe, lo, hi)
+    # one failure can be a passing stall: on an RTX 3070 a server's first tokens took up to 4.2 s
+    # at 4 req/s, then it passed every rate up to 3.83; two fresh servers of the config passed 19.87
+    if not passes(hi):
+        return lo, hi
+    lo = hi
+    hi = min((rate for rate in failed if rate > lo), default=None)
+    if hi is None:
+        lo, hi = _double(probe, lo)
+    return (lo, None) if hi is None else _bisect(probe, lo, hi)
+
+
+def _double(probe: Callable[[float], bool], lo: float) -> tuple[float, float | None]:
+    while lo * 2 <= MAX_RATE:
+        if not probe(lo * 2):
+            return lo, lo * 2
+        lo *= 2
+    return lo, None
+
+
+def _bisect(probe: Callable[[float], bool], lo: float, hi: float) -> tuple[float, float]:
     while hi / lo > 1 + PRECISION:
         mid = math.sqrt(lo * hi)  # the bracket narrows as a ratio, so split it geometrically
-        if passes(mid):
+        if probe(mid):
             lo = mid
         else:
             hi = mid
@@ -503,7 +529,7 @@ def measure_config(
             )
     except ServerFailed as e:
         return record | {"status": e.status, "error": e.error, "wall_s": round(time.monotonic() - started, 1)}
-    at_capacity = next((p for p in probes if p["rate"] == lo), None)
+    at_capacity = next((p for p in reversed(probes) if p["rate"] == lo), None)  # lo may have failed once
     return record | {
         "status": "degraded" if slowed else "ok",
         "error": slowed,
