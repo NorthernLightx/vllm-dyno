@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from dataclasses import asdict
 
@@ -12,6 +13,7 @@ from vllm_dyno.load import (
     Slo,
     Timing,
     find_capacity,
+    gains,
     load_records,
     metric,
     poisson_starts,
@@ -212,10 +214,13 @@ def test_every_session_measures_the_baseline_again_and_reuses_other_configs(tmp_
     ]
 
 
-def test_a_baseline_that_does_not_serve_stops_the_session(tmp_path, monkeypatch, ctx):
+@pytest.mark.parametrize("status", ["oom", "degraded"])
+def test_a_baseline_that_does_not_serve_stops_the_session(tmp_path, monkeypatch, ctx, status):
     s, _ = session(tmp_path, monkeypatch, ctx, "night")
-    monkeypatch.setattr(load, "measure_config", lambda r, *a, **k: {"label": r["label"], "status": "oom", "error": "x"})
-    with pytest.raises(SystemExit, match="the baseline did not serve"):
+    monkeypatch.setattr(
+        load, "measure_config", lambda r, *a, **k: {"label": r["label"], "status": status, "error": "x"}
+    )
+    with pytest.raises(SystemExit, match=f"the baseline did not serve \\({status}: x\\)"):
         s.baseline()
 
 
@@ -302,3 +307,75 @@ def test_search_loads_settings_within_quality_then_combines_those_that_gained(tm
         # int8 KV already ran TRITON_ATTN, so naming it again is not loaded
         "weights=fp8 attention_backend=TRITON_ATTN",
     ]
+
+
+def measure(tmp_path, monkeypatch, ctx, after: float | None) -> dict:
+    """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran."""
+    batched = []
+
+    @contextlib.contextmanager
+    def fake_serving(argv, log_path, env, timeout_s):
+        log_path.write_text("GPU KV cache size: 44,624 tokens\n")
+        yield "http://server"
+
+    async def fake_send(*args, **kwargs):
+        pass
+
+    def fake_probe(url, model, pool, rate, slo, probe_s):
+        n, tpot = 60, after if batched else 8.9
+        met = n if rate <= 20 else 0
+        return {
+            "rate": rate,
+            "requests": n,
+            "finished": n,
+            "met": met,
+            "share_met": met / n,
+            "stopped_early": False,
+            "ttft_p90_ms": 200.0,
+            "tpot_p50_ms": tpot,
+            "tpot_p90_ms": tpot,
+            "client_cpu": 0.1,
+            "kv_peak": 0.5,
+            "preemptions": 0.0,
+        }
+
+    def fake_batch(url, model, pool):
+        batched.append(True)
+        return {"requests": 512, "tput_tok_s": 2900.0, "tpot_p50_ms": 75.0, "kv_peak": 0.9, "preemptions": 0.0}
+
+    monkeypatch.setattr(load, "serving", fake_serving)
+    monkeypatch.setattr(load, "send", fake_send)
+    monkeypatch.setattr(load, "chat_probe", fake_probe)
+    monkeypatch.setattr(load, "batch_run", fake_batch)
+    monkeypatch.setattr(load, "wait_idle", lambda url: None)
+    r = trial("screen", "weights=fp8", 0.007)
+    return load.measure_config(r, ctx, [[1]], Slo(), 30, env={}, out_dir=tmp_path, timeout_s=600)
+
+
+@pytest.mark.parametrize(
+    ("after", "status", "error"),
+    [
+        (12.4, "ok", None),  # 1.4x the first probe
+        (597.0, "degraded", "TPOT p50 at 2 req/s rose from 8.9 to 597.0 ms during the measurement"),
+        (None, "degraded", "no request at 2 req/s finished without error after batch"),
+    ],
+)
+def test_a_server_slower_after_batch_than_at_its_first_probe_is_degraded(
+    tmp_path, monkeypatch, ctx, after, status, error
+):
+    record = measure(tmp_path, monkeypatch, ctx, after)
+    assert (record["status"], record["error"]) == (status, error)
+    assert (record["recheck"]["rate"], record["recheck"]["tpot_p50_ms"]) == (load.START_RATE, after)
+    # a degraded record keeps its numbers for diagnosis
+    assert record["capacity_rps"] == pytest.approx(20, rel=load.PRECISION)
+    assert (record["batch"]["tput_tok_s"], record["kv_tokens"]) == (2900, 44624)
+
+
+def test_a_degraded_config_gains_nothing_and_does_not_count_as_the_same_engine(tmp_path, monkeypatch, ctx):
+    s, _ = session(tmp_path, monkeypatch, ctx, "s")
+    base = loaded("baseline", "s", 10, 1000)
+    slow = loaded("weights=fp8", "s", 30, 3000, backend="TRITON_ATTN") | {"status": "degraded"}
+    (tmp_path / "load.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (base, slow)))
+    assert gains(slow, base) == (None, None)
+    assert promising_under_load([base, slow], 0.1)["weights"] == {}
+    assert s.same_engine(trial("combine", "weights=fp8 attention_backend=TRITON_ATTN", 0.01)) is None

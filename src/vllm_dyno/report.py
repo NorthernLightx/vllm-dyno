@@ -415,9 +415,13 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
     lines += _table(header, rows)
 
     failed = [r for r in records if r["status"] != "ok"]
-    if failed:
+    failed_under_load = [r for r in load if r["status"] != "ok"]
+    if failed or failed_under_load:
         lines += ["", "## Skipped and failed", ""]
         for r in failed:
             where = f" (`{r['dir']}/engine.log`)" if r.get("dir") else ""
             lines.append(f"- `{r['label']}`, {r['stage']}: {r['status']}, {r.get('error')}{where}")
+        for r in failed_under_load:
+            where = f" (`{r['dir']}/server.log`)" if r.get("dir") else ""
+            lines.append(f"- `{r['label']}`, load: {r['status']}, {r.get('error')}{where}")
     return "\n".join(lines) + "\n"

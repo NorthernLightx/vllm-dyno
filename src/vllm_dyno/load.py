@@ -24,6 +24,13 @@ Each `dyno load` is a session that measures the baseline first, and gains are ag
 baseline of the same session: on an RTX 3070 the baseline's chat capacity was 17.45 req/s one
 night and 19.03 the next morning, more than most settings change it.
 
+After batch the server is probed once more at START_RATE, because the capacity search assumes it
+serves as fast at the end as at the start. On an RTX 3070 one server overflowed its GPU memory at
+the first high-concurrency probe, spilled into system memory and never recovered: the search found
+16.0 req/s instead of about 21.7, and batch 391 tok/s instead of about 2,900. A recheck TPOT p50
+above DEGRADED_TPOT times the first probe's marks the record degraded, which keeps it out of gains
+and the recommendation.
+
 <run>/load.json      SLO and settings; a resumed load must match them
 <run>/load.jsonl     one line per config and session
 <run>/load/NNN-*/    server.log of one config
@@ -72,6 +79,9 @@ BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:att
 # chat capacity comes in steps of 4 to 9% (17.45, 19.03, 20.75 req/s near 18),
 # and one config landed a step apart in two runs 15 minutes apart
 LOAD_MIN_GAIN = 0.1
+# the recheck's TPOT p50 over the first probe's, above which the server slowed down during its measurement:
+# the same config measured again came within 2%, a server that spilled into system memory was over 60x slower
+DEGRADED_TPOT = 1.5
 QUEUE = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
 KV_USAGE = {"vllm:kv_cache_usage_perc"}
 PREEMPTIONS = {"vllm:num_preemptions_total"}
@@ -326,6 +336,17 @@ def find_capacity(passes: Callable[[float], bool]) -> tuple[float | None, float 
     return lo, hi
 
 
+def slowdown(first: dict, recheck: dict) -> str | None:
+    """How the server slowed down between its first probe and the recheck after batch; None if it did not."""
+    before, after = first["tpot_p50_ms"], recheck["tpot_p50_ms"]
+    rate = f"{recheck['rate']:g} req/s"
+    if before is None or after is None:
+        return f"no request at {rate} finished without error {'at the start' if before is None else 'after batch'}"
+    if after > DEGRADED_TPOT * before:
+        return f"TPOT p50 at {rate} rose from {before:.1f} to {after:.1f} ms during the measurement"
+    return None
+
+
 def wait_idle(url: str, timeout_s: float = 60) -> None:
     """Block until the server holds no requests, such as those aborted by an early stop."""
     deadline = time.monotonic() + timeout_s
@@ -468,12 +489,24 @@ def measure_config(
                 _f(batch["tpot_p50_ms"], ".1f"),
                 _cache_note(batch),
             )
+            recheck = chat_probe(url, model, pool, START_RATE, slo, probe_s)
+            wait_idle(url)
+            first = next(p for p in probes if p["rate"] == START_RATE)
+            slowed = slowdown(first, recheck)
+            log.log(
+                logging.WARNING if slowed else logging.INFO,
+                "load     %-55s chat %6.2f req/s after batch: TPOT p50 %s ms, %s ms at the start",
+                r["label"],
+                START_RATE,
+                _f(recheck["tpot_p50_ms"], ".1f"),
+                _f(first["tpot_p50_ms"], ".1f"),
+            )
     except ServerFailed as e:
         return record | {"status": e.status, "error": e.error, "wall_s": round(time.monotonic() - started, 1)}
     at_capacity = next((p for p in probes if p["rate"] == lo), None)
     return record | {
-        "status": "ok",
-        "error": None,
+        "status": "degraded" if slowed else "ok",
+        "error": slowed,
         "kv_tokens": int(kv.group(1).replace(",", "")) if kv else None,
         "backend": backends,
         "capacity_rps": lo,
@@ -481,6 +514,7 @@ def measure_config(
         "chat": at_capacity,
         "probes": probes,
         "batch": batch,
+        "recheck": recheck,
         "wall_s": round(time.monotonic() - started, 1),
     }
 
@@ -571,7 +605,7 @@ class LoadSession:
             return None
         auto = cand.replace(attention_backend="auto").label()
         done = load_records(self.run.path)
-        if any(x["label"] == auto and x.get("backend") == cand.attention_backend for x in done):
+        if any(x["label"] == auto and x["status"] == "ok" and x.get("backend") == cand.attention_backend for x in done):
             return auto
         return None
 

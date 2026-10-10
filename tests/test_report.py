@@ -173,3 +173,16 @@ def test_report_recommends_the_load_pick_and_keeps_the_offline_one_below(ctx, tm
     )
     assert "- `weights=fp8 attention_backend=TRITON_ATTN`: chat 22.63 req/s (1.19x the baseline)" in pick
     assert "`weights=fp8`: 1,190 tok/s" in text[text.index("### Without load") :]
+
+
+def test_a_degraded_config_is_listed_with_its_error_and_not_recommended(ctx, tmp_path):
+    load, records = loaded_run(ctx)
+    error = "TPOT p50 at 2 req/s rose from 8.9 to 597.0 ms during the measurement"
+    slow = load_rec("kv_cache_dtype=int8_per_token_head", "s", 40.0, 5000.0)  # ahead of every config on both profiles
+    load.append(slow | {"status": "degraded", "error": error, "dir": "load/007-kv-cache-dtype-int8-per-token-head"})
+    records.append(rec("screen", 1000, 0.013, kv_cache_dtype="int8_per_token_head"))
+    text = render(meta(ctx), [*RECORDS, *records], tmp_path, load, "chat")
+    assert f"## Recommendation\n\n`weights={GPTQ} attention_backend=TRITON_ATTN` for chat traffic" in text
+    assert "| `kv_cache_dtype=int8_per_token_head` |  | degraded |" in text
+    listed = f"- `kv_cache_dtype=int8_per_token_head`, load: degraded, {error} (`{load[-1]['dir']}/server.log`)"
+    assert listed in text[text.index("## Skipped and failed") :]
