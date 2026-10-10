@@ -29,7 +29,7 @@ class Goal:
     max_kl: float = 0.05
     max_ttft_ms: float | None = None
     max_tpot_ms: float | None = None
-    min_gain: float = 0.05  # single-repeat throughput of identical runs differed by 4% on an RTX 3070
+    min_gain: float = 0.05  # smaller gains are within the spread between repeats of the same trial
 
     def score(self, r: dict) -> float:
         return r["tput_tok_s"] if self.target == "throughput" else -r["tpot_ms"]

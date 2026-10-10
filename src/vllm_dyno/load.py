@@ -8,32 +8,26 @@ batch  512 such requests at once, more tokens than any config's KV cache holds, 
        or max_num_seqs decides how many run together. Reports output tokens/s.
 
 The search loads every setting the offline run kept within the quality limit, then combines
-those that gained under load. The offline screen cannot be the filter. On an RTX 3070,
-TRITON_ATTN matched FLASH_ATTN offline but served 24% more chat traffic, because FlashAttention 2
-ran a batch of decodes three to six times slower once a prefill joined it; the offline test
-prefills everything up front.
+those that gained under load. The offline screen cannot be the filter: it prefills every prompt
+up front and then decodes in pure batches, while a server mixes prefills into its decode batches,
+and attention backends differ in how much a prefill slows the decodes beside it.
 
 Every request carries its own cache_salt, so prompts from the pool can repeat without prefix
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
 offline engine's: below 70 GiB of GPU memory, max_num_batched_tokens is 2048 instead of 8192.
 
 Requests leave sampling to the server, which applies the model's generation_config as it would
-for any client that sets nothing. Qwen2.5 asks for temperature 0.7, top-k 20, top-p 0.8 and
-repetition_penalty 1.1. On an RTX 3070 they cost GPTQ-Int8 weights with TRITON_ATTN 8% of their
-chat capacity and 6 to 7% of batch throughput against greedy decoding. Under WSL the penalty
-overflows GPU memory unless torch's allocator uses expandable segments, which probe.serve_env sets
-for servers.
+for any client that sets nothing, so the penalties and top-k/top-p a model asks for are part of
+what is measured.
 
 Each `dyno load` is a session that measures the baseline first, and gains are against the
-baseline of the same session: on an RTX 3070 the baseline's chat capacity was 17.45 req/s one
-night and 19.03 the next morning, more than most settings change it.
+baseline of the same session, because load results drift between sessions by more than most
+settings change them.
 
 After batch the server is probed once more at START_RATE, because the capacity search assumes it
-serves as fast at the end as at the start. On an RTX 3070 one server overflowed its GPU memory at
-the first high-concurrency probe, spilled into system memory and never recovered: the search found
-16.0 req/s instead of about 21.7, and batch 391 tok/s instead of about 2,900. A recheck TPOT p50
-above DEGRADED_TPOT times the first probe's marks the record degraded, which keeps it out of gains
-and the recommendation.
+serves as fast at the end as at the start; a server that overflowed GPU memory into system memory
+stays slow until it restarts. A recheck TPOT p50 above DEGRADED_TPOT times the first probe's marks
+the record degraded, which keeps it out of gains and the recommendation.
 
 <run>/load.json      SLO and settings; a resumed load must match them
 <run>/load.jsonl     one line per config and session
@@ -82,11 +76,11 @@ MIN_PROBE_REQUESTS = 20
 KV_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
 BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:attention )?backend")
 SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`: `(\{.*?\})`")
-# chat capacity comes in steps of 4 to 9% (17.45, 19.03, 20.75 req/s near 18),
-# and one config landed a step apart in two runs 15 minutes apart
+# smaller gains are within noise: a repeated measurement can land one bisection step apart,
+# and the steps find_capacity takes near the limit are up to 9% wide
 LOAD_MIN_GAIN = 0.1
-# the recheck's TPOT p50 over the first probe's, above which the server slowed down during its measurement:
-# the same config measured again came within 2%, a server that spilled into system memory was over 60x slower
+# the recheck's TPOT p50 over the first probe's, above which the server slowed down during its
+# measurement; at START_RATE the server is nearly idle, so its TPOT hardly varies otherwise
 DEGRADED_TPOT = 1.5
 QUEUE = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
 KV_USAGE = {"vllm:kv_cache_usage_perc"}
@@ -336,8 +330,7 @@ def find_capacity(passes: Callable[[float], bool]) -> tuple[float | None, float 
     if lo is None or hi is None:
         return lo, hi
     lo, hi = _bisect(probe, lo, hi)
-    # one failure can be a passing stall: on an RTX 3070 a server's first tokens took up to 4.2 s
-    # at 4 req/s, then it passed every rate up to 3.83; two fresh servers of the config passed 19.87
+    # a single failure can be a passing stall of the server rather than its limit
     if not passes(hi):
         return lo, hi
     lo = hi
