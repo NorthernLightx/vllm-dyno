@@ -172,10 +172,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_load(args: argparse.Namespace) -> None:
-    from .load import LOAD_SHA, Slo, load_records, measure_config, prompt_pool, targets
+    from .load import LOAD_SHA, LoadSession, Slo, load_records, prompt_pool, targets
     from .probe import child_env, query_gpu
     from .report import render
-    from .runner import Run, slug, wait_for_gpu
+    from .runner import Run
     from .space import Context
 
     run = Run(args.run_dir)
@@ -206,24 +206,13 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
 
     pool = prompt_pool(json.loads((args.run_dir / "data.json").read_text()))
-    env = child_env(ctx.host["nvcc"])
-    done = {r["label"] for r in load_records(args.run_dir)}
+    session = LoadSession(
+        run, ctx, pool, slo, args.probe_seconds, child_env(ctx.host["nvcc"]), args.server_timeout, free_mib
+    )
+    session.baseline()
     for r in targets(run.records, args.config):
-        if r["label"] in done:
-            log.info("load     %s recorded earlier", r["label"])
-            continue
-        out_dir = args.run_dir / "load" / f"{len(done):03d}-{slug(r['label'])}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        record = measure_config(
-            r, ctx, pool, slo, args.probe_seconds, env=env, out_dir=out_dir, timeout_s=args.server_timeout
-        )
-        record["dir"] = str(out_dir.relative_to(args.run_dir))
-        with (args.run_dir / "load.jsonl").open("a") as f:
-            f.write(json.dumps(record) + "\n")
-        done.add(r["label"])
-        if record["status"] != "ok":
-            log.info("load     %s %s: %s", r["label"], record["status"], record["error"])
-        wait_for_gpu(free_mib)
+        if r["label"] != "baseline":
+            session.measure(r)
     (args.run_dir / "report.md").write_text(render(run.meta, run.records, args.run_dir, load_records(args.run_dir)))
     log.info("report   %s", args.run_dir / "report.md")
 

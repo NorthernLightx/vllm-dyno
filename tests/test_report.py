@@ -87,20 +87,31 @@ def test_latency_goal_ties_on_tpot(ctx, tmp_path):
     assert "- `weights=org/base-AWQ`: 3.5% higher TPOT, noise 5.0%." in render(latency, [*RECORDS, close], tmp_path)
 
 
-def test_report_shows_capacity_under_load(ctx, tmp_path):
-    slo = {"ttft_ms": 1000, "tpot_ms": 50, "share": 0.9}
-    ok = {
-        "label": "baseline",
+def load_rec(label: str, session: str, capacity: float, batch: float) -> dict:
+    return {
+        "label": label,
         "status": "ok",
-        "slo": slo,
-        "capacity_rps": 11.31,
+        "slo": {"ttft_ms": 1000, "tpot_ms": 50, "share": 0.9},
+        "session": session,
+        "capacity_rps": capacity,
         "capped": False,
         "chat": {"ttft_p90_ms": 210.0, "tpot_p90_ms": 41.2},
-        "batch": {"tput_tok_s": 2500.0, "tpot_p50_ms": 30.5},
+        "batch": {"tput_tok_s": batch, "tpot_p50_ms": 30.5},
         "kv_tokens": 44624,
     }
-    failed = {"label": "weights=fp8", "status": "oom", "slo": slo}
-    text = render(meta(ctx), RECORDS, tmp_path, [ok, failed])
+
+
+def test_report_shows_capacity_under_load_against_the_baseline_of_the_same_session(ctx, tmp_path):
+    failed = {"label": "kv_cache_dtype=fp8", "status": "oom", "slo": load_rec("baseline", "", 1, 1)["slo"]}
+    load = [
+        load_rec("baseline", "night", 10.0, 2000.0),
+        load_rec("weights=fp8", "night", 11.31, 2500.0),
+        load_rec("baseline", "morning", 12.0, 2400.0),
+        load_rec("attention_backend=TRITON_ATTN", "morning", 15.0, 2400.0),
+        failed | {"session": "morning"},
+    ]
+    text = render(meta(ctx), RECORDS, tmp_path, load)
     assert "capacity is the highest rate at which 90% of requests had TTFT ≤ 1000 ms and TPOT ≤ 50 ms" in text
-    assert "| `baseline` | 11.31 | 210 | 41.2 | 2,500 | 30.5 | 44,624 |" in text
-    assert "| `weights=fp8` | oom |" in text
+    assert "| `weights=fp8` | 11.31 | 1.13x | 210 | 41.2 | 2,500 | 1.25x | 30.5 | 44,624 |" in text
+    assert "| `attention_backend=TRITON_ATTN` | 15.00 | 1.25x | 210 | 41.2 | 2,400 | 1.00x | 30.5 | 44,624 |" in text
+    assert "| `kv_cache_dtype=fp8` | oom |" in text

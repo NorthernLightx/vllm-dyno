@@ -5,7 +5,20 @@ import httpx
 import pytest
 
 from vllm_dyno import load
-from vllm_dyno.load import QUEUE, Slo, Timing, find_capacity, metric, poisson_starts, quantile, send, targets
+from vllm_dyno.load import (
+    QUEUE,
+    LoadSession,
+    Slo,
+    Timing,
+    find_capacity,
+    load_records,
+    metric,
+    poisson_starts,
+    quantile,
+    send,
+    targets,
+)
+from vllm_dyno.runner import Run
 
 
 def completion(tokens: int) -> bytes:
@@ -139,3 +152,43 @@ def test_watching_the_server_reports_peak_kv_usage_and_new_preemptions():
     sent = run_send(handler, [[1]] * 4, watch_server=True)
     assert len(sent.timings) == 4
     assert (sent.kv_peak, sent.preemptions) == (0.8, 2)
+
+
+def session(tmp_path, monkeypatch, ctx, sid: str) -> tuple[LoadSession, list[str]]:
+    """A load session over a run with a baseline and an fp8 trial; no server starts."""
+    measured: list[str] = []
+
+    def fake_measure(r, *args, **kwargs):
+        measured.append(r["label"])
+        return {"label": r["label"], "status": "ok"}
+
+    monkeypatch.setattr(load, "measure_config", fake_measure)
+    monkeypatch.setattr(load, "wait_for_gpu", lambda free_mib: None)
+    run = Run(tmp_path)
+    if not run.records:
+        run.append({"key": "screen|baseline", "stage": "screen", "label": "baseline", "status": "ok"})
+        run.append({"key": "screen|weights=fp8", "stage": "screen", "label": "weights=fp8", "status": "ok"})
+    return LoadSession(run, ctx, [[1]], Slo(), 30, {}, 600, 6000, id=sid), measured
+
+
+def test_every_session_measures_the_baseline_again_and_reuses_other_configs(tmp_path, monkeypatch, ctx):
+    first, measured = session(tmp_path, monkeypatch, ctx, "night")
+    first.baseline()
+    first.measure(first.run.records[1])
+    second, measured_again = session(tmp_path, monkeypatch, ctx, "morning")
+    second.baseline()
+    assert second.measure(second.run.records[1])["session"] == "night"
+    assert measured == ["baseline", "weights=fp8"]
+    assert measured_again == ["baseline"]
+    assert [(r["label"], r["session"], r["dir"]) for r in load_records(tmp_path)] == [
+        ("baseline", "night", "load/000-baseline"),
+        ("weights=fp8", "night", "load/001-weights-fp8"),
+        ("baseline", "morning", "load/002-baseline"),
+    ]
+
+
+def test_a_baseline_that_does_not_serve_stops_the_session(tmp_path, monkeypatch, ctx):
+    s, _ = session(tmp_path, monkeypatch, ctx, "night")
+    monkeypatch.setattr(load, "measure_config", lambda r, *a, **k: {"label": r["label"], "status": "oom", "error": "x"})
+    with pytest.raises(SystemExit, match="the baseline did not serve"):
+        s.baseline()

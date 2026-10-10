@@ -14,8 +14,12 @@ Requests decode greedily without penalties, as the offline harness does, whateve
 generation_config asks for. vLLM sizes its memory budget without penalty buffers; with 256
 requests running, Qwen2.5's repetition_penalty 1.1 took over 2 GiB more and overflowed an 8 GB GPU.
 
+Each `dyno load` is a session that measures the baseline first, and gains are against the
+baseline of the same session: on an RTX 3070 the baseline's chat capacity was 17.45 req/s one
+night and 19.03 the next morning, more than most settings change it.
+
 <run>/load.json      SLO and settings; a resumed load must match them
-<run>/load.jsonl     one line per config
+<run>/load.jsonl     one line per config and session
 <run>/load/NNN-*/    server.log of one config
 """
 
@@ -35,12 +39,12 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Generator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
 
-from .runner import classify, kill_group
+from .runner import Run, classify, kill_group, slug, wait_for_gpu
 from .search import candidate_of
 from .space import Context, engine_args, serve_command
 
@@ -454,3 +458,71 @@ def measure_config(
         "batch": batch,
         "wall_s": round(time.monotonic() - started, 1),
     }
+
+
+def session_baseline(load: list[dict], r: dict) -> dict | None:
+    """The baseline measured in the same session as load record r."""
+    return next((b for b in load if b["label"] == "baseline" and b.get("session") == r.get("session")), None)
+
+
+def gains(r: dict, base: dict | None) -> tuple[float | None, float | None]:
+    """Chat capacity and batch throughput of load record r as multiples of its session baseline's."""
+    if base is None or r["status"] != "ok" or base["status"] != "ok":
+        return None, None
+    chat = (r["capacity_rps"] or 0.0) / base["capacity_rps"] if base["capacity_rps"] else None
+    return chat, r["batch"]["tput_tok_s"] / base["batch"]["tput_tok_s"]
+
+
+@dataclass(frozen=True)
+class LoadSession:
+    """One `dyno load` invocation, writing to <run>/load.jsonl."""
+
+    run: Run
+    ctx: Context
+    pool: list[list[int]]
+    slo: Slo
+    probe_s: float
+    env: dict[str, str]
+    server_timeout_s: float
+    free_mib: int  # GPU memory free before the session; each server must give it back
+    id: str = field(default_factory=lambda: time.strftime("%Y%m%d-%H%M%S"))
+
+    def measure(self, r: dict) -> dict:
+        """The load record of trial r's config: one from an earlier session if any, else measured now.
+
+        The baseline is measured again in every session.
+        """
+        done = load_records(self.run.path)
+        earlier = next((x for x in done if x["label"] == r["label"]), None)
+        if earlier and r["label"] != "baseline":
+            log.info("load     %s recorded earlier", r["label"])
+            return earlier
+        out_dir = self.run.path / "load" / f"{len(done):03d}-{slug(r['label'])}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        record = measure_config(
+            r,
+            self.ctx,
+            self.pool,
+            self.slo,
+            self.probe_s,
+            env=self.env,
+            out_dir=out_dir,
+            timeout_s=self.server_timeout_s,
+        )
+        record |= {"session": self.id, "dir": str(out_dir.relative_to(self.run.path))}
+        with (self.run.path / "load.jsonl").open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        if record["status"] != "ok":
+            log.info("load     %s %s: %s", r["label"], record["status"], record["error"])
+        wait_for_gpu(self.free_mib)
+        return record
+
+    def baseline(self) -> dict:
+        r = next((r for r in self.run.records if r["label"] == "baseline" and r["status"] == "ok"), None)
+        if r is None:
+            raise SystemExit(f"{self.run.path} has no successful baseline trial")
+        record = self.measure(r)
+        if record["status"] != "ok":
+            where = self.run.path / record["dir"]
+            raise SystemExit(f"the baseline did not serve ({record['status']}: {record['error']}); see {where}")
+        return record
