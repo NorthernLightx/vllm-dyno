@@ -384,7 +384,9 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument(
         "--planner-url", default="https://openrouter.ai/api/v1", help="OpenAI-compatible endpoint of the llm planner"
     )
-    load.add_argument("--planner-model", default="google/gemma-4-31b-it:free", help="model id at that endpoint")
+    load.add_argument(
+        "--planner-model", default="nvidia/nemotron-3-super-120b-a12b:free", help="model id at that endpoint"
+    )
     load.add_argument(
         "--planner-key-env",
         default="OPENROUTER_API_KEY",
