@@ -241,12 +241,13 @@ def cmd_load(args: argparse.Namespace) -> None:
                 session.measure(r)
     elif args.planner == "llm":
         import os
+        from urllib.parse import urlparse
 
-        from .planner import OPENROUTER, Llm, plan
+        from .planner import Llm, plan
 
         key = os.environ.get(args.planner_key_env) or None
-        if key is None and args.planner_url == OPENROUTER:
-            raise SystemExit(f"OpenRouter needs an API key; set {args.planner_key_env}")
+        if key is None and urlparse(args.planner_url).hostname not in ("localhost", "127.0.0.1"):
+            raise SystemExit(f"{args.planner_url} needs an API key; set {args.planner_key_env}")
         llm = Llm(args.planner_url, args.planner_model, key)
         plan(
             session,
