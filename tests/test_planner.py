@@ -151,29 +151,44 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
         pick("attention_backend=TRITON_ATTN"),
         pick("weights=fp8 kv_cache_dtype=int8_per_token_head"),  # over the KL limit offline
         pick("weights=fp8 attention_backend=TRITON_ATTN"),
+        pick(None),  # refused: no loaded config has changed the KV cache dtype
+        pick("kv_cache_dtype=int8_per_token_head"),
         pick(None),
     ]
     s, llm, measured, sent = setup(
         tmp_path, monkeypatch, ctx, replies, kl={"weights=fp8 kv_cache_dtype=int8_per_token_head": 0.06}
     )
     plan(s, llm, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
-    assert measured == ["baseline", "attention_backend=TRITON_ATTN", "weights=fp8 attention_backend=TRITON_ATTN"]
+    assert measured == [
+        "baseline",
+        "attention_backend=TRITON_ATTN",
+        "weights=fp8 attention_backend=TRITON_ATTN",
+        "kv_cache_dtype=int8_per_token_head",
+    ]
     journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
     assert [(j["config"], j["server"]) for j in journal] == [
         ("attention_backend=TRITON_ATTN", True),
         ("weights=fp8 kv_cache_dtype=int8_per_token_head", False),
         ("weights=fp8 attention_backend=TRITON_ATTN", True),
+        ("kv_cache_dtype=int8_per_token_head", True),
         (None, False),
     ]
     assert journal[0]["result"] == "chat 12.00 req/s (1.20x), batch 1000 tok/s (1.00x), KL 0.0006"
     assert journal[1]["result"] == "KL 0.0600 offline, over the limit; no server started"
+    first = json.loads(sent[0].content)["messages"][1]["content"]
+    assert "Settings no loaded config has changed yet: weights, kv_cache_dtype, attention_backend." in first
+    refused = json.loads(sent[4].content)["messages"]
+    assert refused[-1]["content"].startswith(
+        "stopping is allowed once each setting has been loaded; not yet: kv_cache_dtype."
+    )
     last = json.loads(sent[-1].content)["messages"][1]["content"]
     assert "attention_backend=TRITON_ATTN | 1.20x, 1.00x | chat 12.00 req/s" in last
-    assert "Servers left: 8 of 10, about 7 minutes each." in last
+    assert "Servers left: 7 of 10, about 7 minutes each." in last
+    assert "Settings no loaded config has changed yet" not in last
     allowed_now = last.split("Allowed configs, not loaded yet:\n")[1].split("\n\n")[0].splitlines()
     assert "weights=fp8 kv_cache_dtype=int8_per_token_head" not in allowed_now
     assert "weights=fp8 attention_backend=TRITON_ATTN" not in allowed_now
-    assert len(list((tmp_path / "plan").iterdir())) == 4
+    assert len(list((tmp_path / "plan").iterdir())) == 5
 
 
 def test_the_planner_stops_at_its_server_budget(tmp_path, monkeypatch, ctx):
@@ -194,7 +209,14 @@ def test_the_rules_finish_the_session_when_the_model_names_no_allowed_config_twi
     assert retry[-1]["content"].startswith("'weights=org/base-AWQ' is not in the allowed list.")
     assert [m["role"] for m in retry] == ["system", "user", "assistant", "user"]
     step = json.loads(next((tmp_path / "plan").iterdir()).read_text())
-    assert "answered twice without an allowed config" in step["error"]
+    assert "answered twice with no allowed config or stop" in step["error"]
+
+
+def test_a_stop_counts_once_every_setting_has_been_loaded():
+    options = [cand("weights=fp8")]
+    with pytest.raises(ValueError, match="not yet: weights, speculative"):
+        parse('{"config": null, "hypothesis": "h"}', options, ["weights", "speculative"])
+    assert parse('{"config": null, "hypothesis": "h"}', options, []).config is None
 
 
 def test_the_key_is_taken_out_of_the_environment_and_never_shown():

@@ -6,6 +6,9 @@ within the quality limit on its own. It answers with one config and the gains it
 to stop. A combination is checked offline for quality first, as the rules do, and only a config within
 the limit starts a server, so the budget counts servers.
 
+A stop counts only once every setting the model may change has been loaded at least once: offline speed
+can misjudge a setting under load, and a model that judges by it stops before loading that setting.
+
 If the endpoint fails, or answers twice with something outside the list, the rules finish the session,
 reusing every config already loaded.
 
@@ -18,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
@@ -126,14 +129,19 @@ def _number(value: object) -> float | None:
     return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
-def parse(reply: str, options: list[Candidate]) -> Proposal:
-    """The proposal in a reply; its config must be one of options, its settings in any order."""
+def parse(reply: str, options: list[Candidate], untried: Sequence[str] = ()) -> Proposal:
+    """The proposal in a reply; its config must be one of options, its settings in any order.
+
+    A stop counts only once no setting is left untried.
+    """
     start, end = reply.find("{"), reply.rfind("}")
     if start < 0 or end < start:
         raise ValueError("the reply holds no JSON object")
     d = json.loads(reply[start : end + 1])
     hypothesis = str(d.get("hypothesis") or "")
     if d.get("config") is None:
+        if untried:
+            raise ValueError(f"stopping is allowed once each setting has been loaded; not yet: {', '.join(untried)}")
         return Proposal(None, hypothesis)
     by_key = {_key(c.label()): c for c in options}
     cand = by_key.get(_key(str(d["config"])))
@@ -175,6 +183,7 @@ def brief(
     target: str,
     journal: list[dict],
     options: list[Candidate],
+    untried: Sequence[str],
     servers_left: int,
     max_servers: int,
 ) -> str:
@@ -258,18 +267,29 @@ def brief(
     walls = [r["wall_s"] for r in load if r.get("session") == session.id]
     each = f", about {sum(walls) / len(walls) / 60:.0f} minutes each" if walls else ""
     lines += ["", "Allowed configs, not loaded yet:", *(c.label() for c in options)]
+    if untried:
+        lines += [
+            "",
+            (
+                f"Settings no loaded config has changed yet: {', '.join(untried)}. Offline results can mislead under "
+                "load, so you may stop only once each setting has been loaded at least once; one config may change "
+                "several."
+            ),
+        ]
     lines += ["", f"Servers left: {servers_left} of {max_servers}{each}."]
     return "\n".join(lines)
 
 
-def propose(llm: Llm, messages: list[dict], options: list[Candidate], transcript: list[str]) -> Proposal:
-    """Ask for a pick, and once more if the reply names nothing allowed. Replies go to transcript."""
+def propose(
+    llm: Llm, messages: list[dict], options: list[Candidate], untried: Sequence[str], transcript: list[str]
+) -> Proposal:
+    """Ask for a pick, and once more if the reply names nothing allowed or stops too early. Replies go to transcript."""
     problem = ""
     for _ in range(2):
         reply = llm.complete(messages)
         transcript.append(reply)
         try:
-            return parse(reply, options)
+            return parse(reply, options, untried)
         except ValueError as e:
             problem = str(e)
         messages = [
@@ -277,7 +297,7 @@ def propose(llm: Llm, messages: list[dict], options: list[Candidate], transcript
             {"role": "assistant", "content": reply},
             {"role": "user", "content": f"{problem}. Answer again with one JSON object, as the system message says."},
         ]
-    raise PlannerError(f"{llm.model} answered twice without an allowed config: {problem}")
+    raise PlannerError(f"{llm.model} answered twice with no allowed config or stop: {problem}")
 
 
 def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Candidate]:
@@ -289,6 +309,12 @@ def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Can
         if r["stage"] == "combine" and (r["status"] != "ok" or r["kl"] > goal.max_kl)
     }
     return [c for c in allowed(session.ctx, session.run.records, goal.max_kl) if c.label() not in done | failed]
+
+
+def untried(session: LoadSession, options: list[Candidate]) -> list[str]:
+    """Settings that a remaining config changes and no config loaded so far did."""
+    tried = {k for r in load_records(session.run.path) for k in candidate_of(r).changes()}
+    return [k for k in KNOBS if k not in tried and any(k in c.changes() for c in options)]
 
 
 def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Goal) -> tuple[str, bool]:
@@ -339,17 +365,18 @@ def plan(
         if not options:
             log.info("plan     every allowed config is loaded")
             return
+        left = untried(session, options)
         messages = [
             {"role": "system", "content": SYSTEM},
             {
                 "role": "user",
-                "content": brief(session, goal, target, journal, options, max_servers - servers, max_servers),
+                "content": brief(session, goal, target, journal, options, left, max_servers - servers, max_servers),
             },
         ]
         replies: list[str] = []
         step_file = steps_dir / f"{session.id}-{len(journal) + 1:02d}.json"
         try:
-            p = propose(llm, messages, options, replies)
+            p = propose(llm, messages, options, left, replies)
         except PlannerError as e:
             step_file.write_text(json.dumps({"messages": messages, "replies": replies, "error": str(e)}, indent=2))
             log.warning("plan     %s; the rules finish the session", e)
