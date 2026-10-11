@@ -199,3 +199,11 @@ def test_the_rules_finish_the_session_when_the_model_names_no_allowed_config_twi
     assert [m["role"] for m in retry] == ["system", "user", "assistant", "user"]
     step = json.loads(next((tmp_path / "plan").iterdir()).read_text())
     assert "answered twice without an allowed config" in step["error"]
+
+
+def test_the_key_is_taken_out_of_the_environment_and_never_shown():
+    env = {"OPENROUTER_API_KEY": "secret", "HF_HOME": "/hf"}
+    assert planner.take_key(env, "OPENROUTER_API_KEY") == "secret"
+    assert env == {"HF_HOME": "/hf"}
+    assert planner.take_key({"K": ""}, "K") is None
+    assert "secret" not in repr(Llm("https://example.org/v1", "m", "secret"))

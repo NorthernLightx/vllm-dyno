@@ -18,7 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import MutableMapping
+from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 
@@ -60,13 +61,18 @@ class PlannerError(Exception):
     pass
 
 
+def take_key(env: MutableMapping[str, str], name: str) -> str | None:
+    """The value of variable name, removed from env so that processes started with env do not inherit it."""
+    return env.pop(name, None) or None
+
+
 @dataclass(frozen=True)
 class Llm:
     """A chat model behind an OpenAI-compatible endpoint, such as OpenRouter or `vllm serve`."""
 
     url: str
     model: str
-    key: str | None = None
+    key: str | None = field(default=None, repr=False)
     timeout_s: float = 300
     transport: httpx.BaseTransport | None = None
 
