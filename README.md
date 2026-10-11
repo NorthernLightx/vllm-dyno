@@ -113,7 +113,7 @@ Under WSL, the Windows graphics driver moves GPU memory into system memory inste
 - Requests sample with the model's own defaults. Clients that send other sampling parameters get different capacity: on the RTX 3070 with GPTQ-Int8 and TRITON_ATTN, greedy requests reached 21.67 req/s and Qwen2.5's defaults 19.87.
 - Without nvcc on PATH, as under WSL, FlashInfer is unavailable: its attention backend, fp8 KV cache below compute capability 8.9, and its sampler, so vLLM samples with Triton kernels instead.
 - Chat capacity comes in bisection steps of 4 to 9%, and each config is loaded once, so configs within 10% of each other count as a tie.
-- `max_num_seqs` stays at vLLM's default of 256, which limits batch throughput once the KV cache holds more requests than that. With int8 KV cache on top of quantized weights, the batch profile used under half the cache.
+- `max_num_seqs` and `max_num_batched_tokens` stay at vLLM's serving defaults, 256 and 2,048 on GPUs under 70 GiB. Raising them did not help on the RTX 3070. With the GPTQ-Int8 checkpoint and int8 KV cache, the batch profile used 38% of the cache, and `--max-num-seqs 512` lowered batch throughput from 2,850 to 2,513 tok/s. With GPTQ-Int8 and TRITON_ATTN, `--max-num-batched-tokens 4096` left batch throughput level and raised TPOT p90 at 21.67 req/s from 51 to 54 ms.
 - KL is computed over the baseline's top 20 tokens and reads slightly low.
 - One GPU, no tensor parallelism.
 - Tested only on an RTX 3070 with vLLM 0.31.
