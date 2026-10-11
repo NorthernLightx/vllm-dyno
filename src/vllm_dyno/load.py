@@ -2,8 +2,8 @@
 
 chat   256-token prompts with 128-token answers arriving as a Poisson process. Capacity is the
        highest request rate at which the SLO share of requests meet both the TTFT and the TPOT
-       limit, found by doubling the rate and then bisecting, with the lowest failing rate
-       probed twice.
+       limit, found by doubling the rate and then bisecting, with the failing rate it settles
+       on probed twice.
 batch  512 such requests at once, more tokens than any config's KV cache holds, so the cache
        or max_num_seqs decides how many run together. Reports output tokens/s.
 
@@ -314,9 +314,10 @@ def find_capacity(passes: Callable[[float], bool]) -> tuple[float | None, float 
     """The highest rate found to pass and the lowest found to fail.
 
     Doubles from START_RATE until a rate fails, or halves until one passes, then bisects until
-    the two are within PRECISION. The failing rate is then probed once more, and if it passes
-    the search goes on above it. The passing rate is None if MIN_RATE fails; the failing one
-    is None if MAX_RATE passes.
+    the two are within PRECISION. The failing rate is then probed once more, and while it
+    passes the search goes on above it and ends with the same check, so the failing rate
+    returned failed twice. The passing rate is None if MIN_RATE fails; the failing one is None
+    if MAX_RATE passes.
     """
     failed: list[float] = []
 
@@ -340,14 +341,16 @@ def find_capacity(passes: Callable[[float], bool]) -> tuple[float | None, float 
     if lo is None or hi is None:
         return lo, hi
     lo, hi = _bisect(probe, lo, hi)
-    # a single failure can be a passing stall of the server rather than its limit
-    if not passes(hi):
-        return lo, hi
-    lo = hi
-    hi = min((rate for rate in failed if rate > lo), default=None)
-    if hi is None:
-        lo, hi = _double(probe, lo)
-    return (lo, None) if hi is None else _bisect(probe, lo, hi)
+    # a single failure can be a passing stall of the server, such as a kernel compiled on first use
+    while passes(hi):
+        lo = hi
+        hi = min((rate for rate in failed if rate > lo), default=None)
+        if hi is None:
+            lo, hi = _double(probe, lo)
+            if hi is None:
+                return lo, None
+        lo, hi = _bisect(probe, lo, hi)
+    return lo, hi
 
 
 def _double(probe: Callable[[float], bool], lo: float) -> tuple[float, float | None]:

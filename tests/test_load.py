@@ -138,6 +138,19 @@ def test_one_failure_that_does_not_repeat_does_not_cap_the_capacity(stall):
     assert rates.count(stall) == 2
 
 
+def test_stalls_at_two_rates_do_not_cap_the_capacity():
+    rates = []
+
+    def passes(rate: float) -> bool:
+        rates.append(rate)
+        return rate <= 20 and not (rate in (4.0, 8.0) and rates.count(rate) == 1)
+
+    lo, hi = find_capacity(passes)
+    assert lo is not None and hi is not None
+    assert lo <= 20 < hi and hi / lo <= 1 + load.PRECISION
+    assert rates.count(4.0) == rates.count(8.0) == rates.count(hi) == 2
+
+
 def test_the_lowest_failing_rate_is_probed_once_more_and_then_stands():
     rates = []
 
