@@ -244,7 +244,7 @@ def cmd_load(args: argparse.Namespace) -> None:
 
         from .planner import OPENROUTER, Llm, plan
 
-        key = os.environ.get(args.planner_key_env)
+        key = os.environ.get(args.planner_key_env) or None
         if key is None and args.planner_url == OPENROUTER:
             raise SystemExit(f"OpenRouter needs an API key; set {args.planner_key_env}")
         llm = Llm(args.planner_url, args.planner_model, key)
@@ -365,7 +365,7 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument(
         "--planner-key-env",
         default="OPENROUTER_API_KEY",
-        help="environment variable holding the endpoint's API key; unset sends none",
+        help="environment variable holding the endpoint's API key; unset or empty sends none",
     )
     load.add_argument("--max-servers", type=int, default=10, help="configs the llm planner may load after the baseline")
     load.add_argument(
