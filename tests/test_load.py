@@ -380,7 +380,7 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, 
 
     Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline.
     """
-    batched, lone_params = [], []
+    batched, lone_params, warmup_sizes = [], [], []
 
     @contextlib.contextmanager
     def fake_serving(argv, log_path, env, timeout_s):
@@ -390,6 +390,8 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, 
     async def fake_send(url, model, prompts, starts, max_tokens, slo=None, *, params=None, **kwargs):
         if max_tokens == load.OUTPUT_LEN:  # the warmup asks for fewer
             lone_params.append(params)
+        else:
+            warmup_sizes.append(len(prompts))
         return Sent([Timing(0.05, lone / 1000, max_tokens)] * len(prompts), 1.0, 0.0)
 
     def fake_probe(url, model, pool, rate, slo, probe_s):
@@ -422,6 +424,7 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, 
     r = trial("screen", label, 0.007) | {"tpot_ms": 8.0}
     record = load.measure_config(r, ctx, [[1]], Slo(), 30, env={}, out_dir=tmp_path, timeout_s=600)
     assert lone_params == [GREEDY, GREEDY]
+    assert warmup_sizes == list(load.WARMUP_BATCHES)
     return record
 
 

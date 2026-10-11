@@ -77,6 +77,12 @@ MIN_RATE = 0.125
 MAX_RATE = 256.0
 PRECISION = 0.05  # bisection stops once the passing and failing rates are this close
 MIN_PROBE_REQUESTS = 20
+# vLLM's Triton top-k/top-p kernels compile on first use, separately for ranges of batch sizes up
+# to 64 and above it, and each compile holds the server up for a second or more. Its own JIT warmup
+# leaves them out, so bursts of every size up to 64 and a few above compile them before measuring.
+WARMUP_BATCHES = (*range(1, 65), 80, 128, 256)
+WARMUP_PROMPT_LEN = 16
+WARMUP_TOKENS = 4
 KV_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
 BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:attention )?backend")
 SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`: `(\{.*?\})`")
@@ -271,6 +277,13 @@ def summary(timings: list[Timing], n: int) -> dict:
         "tpot_p50_ms": _ms(quantile([t.tpot_s for t in ok], 0.5)),
         "tpot_p90_ms": _ms(quantile([t.tpot_s for t in ok], 0.9)),
     }
+
+
+def warm_up(url: str, model: str, pool: list[list[int]]) -> None:
+    """Send short requests in bursts of each size in WARMUP_BATCHES, sampled as the server samples."""
+    for n in WARMUP_BATCHES:
+        prompts = [pool[i % len(pool)][:WARMUP_PROMPT_LEN] for i in range(n)]
+        asyncio.run(send(url, model, prompts, [0.0] * n, WARMUP_TOKENS))
 
 
 def chat_probe(url: str, model: str, pool: list[list[int]], rate: float, slo: Slo, probe_s: float) -> dict:
@@ -497,7 +510,7 @@ def measure_config(
             started_log = log_path.read_text(errors="replace")
             kv, backends = KV_LINE.search(started_log), attention_backends(started_log)
             sampling = SAMPLING_LINE.search(started_log)
-            asyncio.run(send(url, model, pool[:4], [0.0] * 4, 16))  # first requests pay one-off setup costs
+            warm_up(url, model, pool)
             # the faster of two, so a kernel compiled on first use does not decide
             lone = [asyncio.run(send(url, model, pool[:1], [0.0], OUTPUT_LEN, params=GREEDY)) for _ in range(2)]
             lone_ms = min((t.tpot_s * 1000 for s in lone for t in s.timings if t.error is None), default=None)
