@@ -239,6 +239,24 @@ def cmd_load(args: argparse.Namespace) -> None:
         for r in targets(run.records, args.config):
             if r["label"] != "baseline":
                 session.measure(r)
+    elif args.planner == "llm":
+        import os
+
+        from .planner import OPENROUTER, Llm, plan
+
+        key = os.environ.get(args.planner_key_env)
+        if key is None and args.planner_url == OPENROUTER:
+            raise SystemExit(f"OpenRouter needs an API key; set {args.planner_key_env}")
+        llm = Llm(args.planner_url, args.planner_model, key)
+        plan(
+            session,
+            llm,
+            Goal(**run.meta["goal"]),
+            args.goal,
+            max_servers=args.max_servers,
+            max_combos=args.max_combos,
+            trial_timeout_s=args.trial_timeout,
+        )
     else:
         session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
     text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir), load_goal(args.run_dir))
@@ -334,6 +352,22 @@ def main(argv: list[str] | None = None) -> None:
         "--goal", choices=["chat", "batch"], default="chat", help="traffic profile to recommend a config for"
     )
     load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
+    load.add_argument(
+        "--planner",
+        choices=["rules", "llm"],
+        default="rules",
+        help="rules: every setting, then combinations of those that gained; llm: a model picks each config",
+    )
+    load.add_argument(
+        "--planner-url", default="https://openrouter.ai/api/v1", help="OpenAI-compatible endpoint of the llm planner"
+    )
+    load.add_argument("--planner-model", default="google/gemma-4-31b-it:free", help="model id at that endpoint")
+    load.add_argument(
+        "--planner-key-env",
+        default="OPENROUTER_API_KEY",
+        help="environment variable holding the endpoint's API key; unset sends none",
+    )
+    load.add_argument("--max-servers", type=int, default=10, help="configs the llm planner may load after the baseline")
     load.add_argument(
         "--trial-timeout", type=float, default=900, help="seconds before a combination's quality trial is killed"
     )
