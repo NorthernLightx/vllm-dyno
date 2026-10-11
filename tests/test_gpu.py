@@ -22,7 +22,7 @@ def context() -> Context:
     gpu, host = query_gpu(), host_facts()
     cfg, weight_bytes, revision = model_files(MODEL)
     shape = AttentionShape.from_hf_config(cfg)
-    return Context(MODEL, gpu, host, shape, weight_bytes, (), memory_utilization(gpu), 2048, revision)
+    return Context(MODEL, gpu, host, shape, weight_bytes, (), memory_utilization(gpu, wsl=host["wsl"]), 2048, revision)
 
 
 def test_baseline_writes_a_reference_and_a_rerun_matches_it(tmp_path):

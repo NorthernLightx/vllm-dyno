@@ -42,7 +42,7 @@ def _build_context(args: argparse.Namespace):
         if ckpt is None:
             raise SystemExit(f"{repo}: config.json declares no quantization method vLLM loads")
         checkpoints.append(ckpt)
-    util = memory_utilization(gpu)
+    util = memory_utilization(gpu, wsl=host["wsl"])
     if util < 0.2:
         raise SystemExit(f"only {gpu.free_mib:,} of {gpu.total_mib:,} MiB GPU memory is free")
     ctx = Context(

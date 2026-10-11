@@ -44,8 +44,13 @@ def query_gpu() -> Gpu:
     return Gpu(name, float(cap), int(total), int(free))
 
 
-def memory_utilization(gpu: Gpu, reserve_mib: int = 512, cap: float = 0.9) -> float:
-    """Largest gpu_memory_utilization vLLM accepts now: it refuses to start unless free >= total * utilization."""
+def memory_utilization(gpu: Gpu, *, wsl: bool = False, cap: float = 0.9) -> float:
+    """Largest gpu_memory_utilization vLLM accepts now: it refuses to start unless free >= total * utilization.
+
+    Under WSL the Windows desktop shares the GPU, its use grows as windows open, and WDDM moves
+    allocations to system memory rather than refuse them, so more is left for the desktop to grow into.
+    """
+    reserve_mib = 1536 if wsl else 512
     return min(cap, math.floor((gpu.free_mib - reserve_mib) / gpu.total_mib * 100) / 100)
 
 

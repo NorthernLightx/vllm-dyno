@@ -10,6 +10,12 @@ def test_memory_utilization_leaves_free_memory_check_satisfied():
     assert util * gpu.total_mib <= gpu.free_mib
 
 
+def test_memory_utilization_leaves_the_windows_desktop_room_under_wsl():
+    gpu = Gpu("x", 8.6, total_mib=8192, free_mib=7502)
+    assert memory_utilization(gpu) == 0.85
+    assert memory_utilization(gpu, wsl=True) == 0.72
+
+
 def test_memory_utilization_is_capped():
     assert memory_utilization(Gpu("x", 9.0, total_mib=80000, free_mib=79500)) == 0.9
 
