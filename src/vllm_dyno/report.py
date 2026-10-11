@@ -202,7 +202,7 @@ def _offline_tie_lines(records: list[dict], best: dict, goal: Goal) -> list[str]
 
 
 def _commands(cand: Candidate, ctx: Context, run_dir: Path) -> list[str]:
-    env_vars = [f"{k}={v}" for k, v in serve_env(ctx.host, server=True).items()]
+    env_vars = [f"{k}={v}" for k, v in serve_env(ctx.host, ctx.util).items()]
     lines = [
         "Start it with the environment the trials ran in:",
         "",

@@ -22,7 +22,7 @@ def test_no_command_prints_usage(capsys):
     "meta",
     [
         {"harness_sha": "000000000000"},
-        {"harness_sha": HARNESS_SHA, "context": {"host": {"nvcc": False, "wsl": False}}, "env": {}},
+        {"harness_sha": HARNESS_SHA, "context": {"host": {"nvcc": False, "wsl": False}, "util": 0.6}, "env": {}},
     ],
 )
 def test_load_search_refuses_a_run_measured_with_other_offline_code_or_environment(tmp_path, meta):

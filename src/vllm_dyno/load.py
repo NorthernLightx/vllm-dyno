@@ -56,7 +56,6 @@ from pathlib import Path
 
 import httpx
 
-from .probe import child_env
 from .runner import Run, classify, kill_group, slug, wait_for_gpu
 from .search import SCREEN, Goal, Searcher, candidate_of, combinations
 from .space import KNOBS, Context, engine_args, serve_command
@@ -646,8 +645,7 @@ class LoadSession:
         if not combos:
             log.info("load     fewer than two settings gained %.0f%%; nothing to combine", LOAD_MIN_GAIN * 100)
             return
-        trial_env = child_env(self.ctx.host, server=False)
-        quality = Searcher(self.run, self.ctx, goal, trial_env, trial_timeout_s).stage("combine", combos, SCREEN)
+        quality = Searcher(self.run, self.ctx, goal, self.env, trial_timeout_s).stage("combine", combos, SCREEN)
         for r in quality:
             if r["status"] != "ok" or r["kl"] > goal.max_kl:
                 continue
