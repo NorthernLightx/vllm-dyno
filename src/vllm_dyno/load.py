@@ -31,7 +31,7 @@ run DEGRADED_TPOT times slower than that engine did; a server that does is not m
 Speculative configs are exempt: how fast they decode depends on how much of the text their drafts
 guess, and these requests' text is not the offline engine's.
 After batch the server is probed at START_RATE again, and its TPOT p50 must stay within
-DEGRADED_TPOT times the first probe's: a server that overflowed GPU memory into system memory
+SLOWED_TPOT times the first probe's: a server that overflowed GPU memory into system memory
 stays slow until it restarts.
 
 <run>/load.json      SLO and settings; a resumed load must match them
@@ -89,10 +89,12 @@ SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`:
 # smaller gains are within noise: a repeated measurement can land one bisection step apart,
 # and the steps find_capacity takes near the limit are up to 9% wide
 LOAD_MIN_GAIN = 0.1
-# a lone request's TPOT over the offline engine's, or the recheck's TPOT p50 over the first probe's,
-# above which the server is degraded; HTTP streaming, and the few requests that share a step at
-# START_RATE, slow decoding by less than that
+# a lone request's TPOT over the offline engine's, above which the server is degraded; HTTP
+# streaming, and the few requests that share a step at START_RATE, slow decoding by less than that
 DEGRADED_TPOT = 1.5
+# the recheck's TPOT p50 over the first probe's, above which the server is degraded; both probes
+# send the same traffic to the same server, so on a healthy one they differ by a few percent
+SLOWED_TPOT = 1.2
 GREEDY = {"temperature": 0.0, "repetition_penalty": 1.0}  # how the offline engine decodes
 QUEUE = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
 KV_USAGE = {"vllm:kv_cache_usage_perc"}
@@ -397,7 +399,7 @@ def slowdown(first: dict, recheck: dict) -> str | None:
     rate = f"{recheck['rate']:g} req/s"
     if before is None or after is None:
         return f"no request at {rate} finished without error {'at the start' if before is None else 'after batch'}"
-    if after > DEGRADED_TPOT * before:
+    if after > SLOWED_TPOT * before:
         return f"TPOT p50 at {rate} rose from {before:.1f} to {after:.1f} ms during the measurement"
     return None
 

@@ -431,7 +431,8 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, 
 @pytest.mark.parametrize(
     ("after", "status", "error"),
     [
-        (12.4, "ok", None),  # 1.4x the first probe
+        (10.6, "ok", None),  # 1.19x the first probe
+        (11.0, "degraded", "TPOT p50 at 2 req/s rose from 8.9 to 11.0 ms during the measurement"),
         (597.0, "degraded", "TPOT p50 at 2 req/s rose from 8.9 to 597.0 ms during the measurement"),
         (None, "degraded", "no request at 2 req/s finished without error after batch"),
     ],
