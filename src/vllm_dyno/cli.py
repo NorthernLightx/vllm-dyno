@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -189,15 +190,24 @@ def _trial_env(meta: dict) -> dict[str, str | None]:
     return measured_env(child_env(host, util), host, util)
 
 
+def _local(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    return urlparse(url).hostname in ("localhost", "127.0.0.1")
+
+
 def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
-    from .planner import plan_records
+    from .planner import plan_records, take_key
     from .probe import child_env, measured_env, query_gpu
     from .report import render
     from .runner import HARNESS_SHA, Run
     from .search import Goal
     from .space import Context
 
+    key = take_key(os.environ, args.planner_key_env)  # no process started from here on has a use for it
+    if args.planner == "llm" and not args.config and key is None and not _local(args.planner_url):
+        raise SystemExit(f"{args.planner_url} needs an API key; set {args.planner_key_env}")
     run = Run(args.run_dir)
     if not (args.run_dir / "run.json").exists():
         raise SystemExit(f"{args.run_dir} is not a run directory")
@@ -244,14 +254,8 @@ def cmd_load(args: argparse.Namespace) -> None:
             if r["label"] != "baseline":
                 session.measure(r)
     elif args.planner == "llm":
-        import os
-        from urllib.parse import urlparse
-
         from .planner import Llm, plan
 
-        key = os.environ.get(args.planner_key_env) or None
-        if key is None and urlparse(args.planner_url).hostname not in ("localhost", "127.0.0.1"):
-            raise SystemExit(f"{args.planner_url} needs an API key; set {args.planner_key_env}")
         llm = Llm(args.planner_url, args.planner_model, key)
         plan(
             session,
@@ -296,7 +300,6 @@ def cmd_report(args: argparse.Namespace) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
-    import os
     import shlex
 
     from .load import load_goal, load_records
