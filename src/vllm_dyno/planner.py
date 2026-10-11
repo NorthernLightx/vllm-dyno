@@ -79,8 +79,9 @@ class Llm:
     def complete(self, messages: list[dict]) -> str:
         """The reply to messages, retried while the endpoint is rate limited or unavailable."""
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
-        # sampling stays at the endpoint's defaults: Claude models from 4.7 on refuse a temperature below 1
-        body = {"model": self.model, "messages": messages, "response_format": {"type": "json_object"}}
+        # Only what every endpoint accepts: Claude models from 4.7 on refuse a temperature below 1, and
+        # Anthropic's endpoint refuses response_format json_object. parse() finds the JSON in plain text.
+        body = {"model": self.model, "messages": messages}
         with httpx.Client(base_url=self.url, headers=headers, timeout=self.timeout_s, transport=self.transport) as c:
             problem = ""
             for attempt in range(1, RETRIES + 1):
