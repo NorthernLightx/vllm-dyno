@@ -103,8 +103,18 @@ def test_an_endpoint_that_refuses_the_request_is_not_asked_again():
     assert len(sent) == 1 and "authorization" not in sent[0].headers
 
 
-def setup(tmp_path, monkeypatch, ctx, replies: list[str], kl: dict[str, float] | None = None):
-    """A load session over SCREEN whose servers serve 10 req/s and 1000 tok/s, more with TRITON_ATTN."""
+def setup(
+    tmp_path,
+    monkeypatch,
+    ctx,
+    replies: list[str],
+    kl: dict[str, float] | None = None,
+    slow: frozenset[str] = frozenset(),
+):
+    """A load session over SCREEN whose servers serve 10 req/s and 1000 tok/s, more with TRITON_ATTN.
+
+    The first server of each config in slow is degraded.
+    """
     run = Run(tmp_path)
     for r in SCREEN:
         run.append(r)
@@ -116,7 +126,8 @@ def setup(tmp_path, monkeypatch, ctx, replies: list[str], kl: dict[str, float] |
         return {
             "label": r["label"],
             **{k: r[k] for k in KNOBS},
-            "status": "ok",
+            "status": "degraded" if r["label"] in slow and measured.count(r["label"]) == 1 else "ok",
+            "error": None,
             "capacity_rps": 12.0 if triton else 10.0,
             "chat": {"tpot_p90_ms": 40.0},
             "batch": {"tput_tok_s": 1000.0, "kv_peak": 0.5, "preemptions": 0},
@@ -196,6 +207,13 @@ def test_the_planner_stops_at_its_server_budget(tmp_path, monkeypatch, ctx):
     s, llm, measured, _ = setup(tmp_path, monkeypatch, ctx, replies)
     plan(s, llm, Goal(), "chat", max_servers=1, max_combos=8, trial_timeout_s=900)
     assert measured == ["baseline", "attention_backend=TRITON_ATTN"]
+
+
+def test_a_server_started_again_after_it_degraded_counts_against_the_budget(tmp_path, monkeypatch, ctx):
+    replies = [pick("attention_backend=TRITON_ATTN"), pick("weights=fp8")]
+    s, llm, measured, _ = setup(tmp_path, monkeypatch, ctx, replies, slow=frozenset({"attention_backend=TRITON_ATTN"}))
+    plan(s, llm, Goal(), "chat", max_servers=2, max_combos=8, trial_timeout_s=900)
+    assert measured == ["baseline", "attention_backend=TRITON_ATTN", "attention_backend=TRITON_ATTN"]
 
 
 def test_the_rules_finish_the_session_when_the_model_names_no_allowed_config_twice(tmp_path, monkeypatch, ctx):

@@ -398,7 +398,10 @@ def plan(
             p.hypothesis,
         )
         result, started = _measure(session, searcher, p.config, goal)
-        servers += started
+        # a degraded server is started twice
+        servers = sum(
+            r.get("session") == session.id and r["label"] != "baseline" for r in load_records(session.run.path)
+        )
         log.info("plan     %s: %s", label, result)
         entry = {
             "config": label,

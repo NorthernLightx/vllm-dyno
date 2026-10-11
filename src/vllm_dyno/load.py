@@ -32,7 +32,7 @@ Speculative configs are exempt: how fast they decode depends on how much of the 
 guess, and these requests' text is not the offline engine's.
 After batch the server is probed at START_RATE again, and its TPOT p50 must stay within
 SLOWED_TPOT times the first probe's: a server that overflowed GPU memory into system memory
-stays slow until it restarts.
+stays slow until it restarts. A degraded server is started once more, and the second record stands.
 
 <run>/load.json      SLO and settings; a resumed load must match them
 <run>/load.jsonl     one line per config and session
@@ -588,8 +588,9 @@ def measure_config(
 
 
 def session_baseline(load: list[dict], r: dict) -> dict | None:
-    """The baseline measured in the same session as load record r."""
-    return next((b for b in load if b["label"] == "baseline" and b.get("session") == r.get("session")), None)
+    """The baseline load record r's session went on with: the last one measured in it."""
+    same = (b for b in reversed(load) if b["label"] == "baseline" and b.get("session") == r.get("session"))
+    return next(same, None)
 
 
 def gains(r: dict, base: dict | None) -> tuple[float | None, float | None]:
@@ -629,14 +630,22 @@ class LoadSession:
     def measure(self, r: dict) -> dict:
         """The load record of trial r's config: one from an earlier session if any, else measured now.
 
-        The baseline is measured again in every session.
+        The baseline is measured again in every session. A server can slow down for reasons outside its
+        config, so a degraded one is started once more, and a degraded record is not reused.
         """
         done = load_records(self.run.path)
-        earlier = next((x for x in done if x["label"] == r["label"]), None)
+        earlier = next((x for x in done if x["label"] == r["label"] and x["status"] != "degraded"), None)
         if earlier and r["label"] != "baseline":
             log.info("load     %s recorded earlier", r["label"])
             return earlier
-        out_dir = self.run.path / "load" / f"{len(done):03d}-{slug(r['label'])}"
+        record = self._serve(r)
+        if record["status"] == "degraded":
+            log.info("load     %s: starting its server once more", r["label"])
+            record = self._serve(r)
+        return record
+
+    def _serve(self, r: dict) -> dict:
+        out_dir = self.run.path / "load" / f"{len(load_records(self.run.path)):03d}-{slug(r['label'])}"
         out_dir.mkdir(parents=True, exist_ok=True)
         record = measure_config(
             r,

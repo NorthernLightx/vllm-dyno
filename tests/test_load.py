@@ -22,6 +22,7 @@ from vllm_dyno.load import (
     promising_under_load,
     quantile,
     send,
+    session_baseline,
     targets,
 )
 from vllm_dyno.runner import Run
@@ -278,6 +279,31 @@ def test_every_session_measures_the_baseline_again_and_reuses_other_configs(tmp_
         ("weights=fp8", "night", "load/001-weights-fp8"),
         ("baseline", "morning", "load/002-baseline"),
     ]
+
+
+def test_a_degraded_server_is_started_once_more_and_its_config_measured_again_in_later_sessions(
+    tmp_path, monkeypatch, ctx
+):
+    night, _ = session(tmp_path, monkeypatch, ctx, "night")
+    morning, _ = session(tmp_path, monkeypatch, ctx, "morning")
+    statuses = iter(["ok", "degraded", "degraded", "degraded", "ok", "ok"])
+    monkeypatch.setattr(
+        load, "measure_config", lambda r, *a, **k: {"label": r["label"], "status": next(statuses), "error": "slow"}
+    )
+    night.baseline()
+    assert night.measure(night.run.records[1])["status"] == "degraded"
+    morning.baseline()
+    fp8 = morning.measure(morning.run.records[1])
+    records = load_records(tmp_path)
+    assert [(r["label"], r["session"], r["status"]) for r in records] == [
+        ("baseline", "night", "ok"),
+        ("weights=fp8", "night", "degraded"),
+        ("weights=fp8", "night", "degraded"),
+        ("baseline", "morning", "degraded"),
+        ("baseline", "morning", "ok"),
+        ("weights=fp8", "morning", "ok"),
+    ]
+    assert session_baseline(records, fp8) == records[4]
 
 
 @pytest.mark.parametrize("status", ["oom", "degraded"])
