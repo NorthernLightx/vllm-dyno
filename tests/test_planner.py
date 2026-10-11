@@ -92,12 +92,11 @@ def test_the_endpoint_is_asked_again_while_it_is_rate_limited(monkeypatch):
     assert waits == [3.0, 30.0]
     assert str(sent[0].url) == "https://example.org/api/v1/chat/completions"
     assert sent[0].headers["authorization"] == "Bearer secret"
-    body = json.loads(sent[0].content)
-    assert (body["model"], body["temperature"], body["response_format"]) == (
-        "org/model:free",
-        0,
-        {"type": "json_object"},
-    )
+    assert json.loads(sent[0].content) == {
+        "model": "org/model:free",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_object"},
+    }
 
 
 def test_an_endpoint_that_refuses_the_request_is_not_asked_again():
