@@ -216,7 +216,12 @@ def brief(
             f"KL against the base model must stay at most {goal.max_kl}."
         ),
         "",
-        "Offline trials, in one engine that prefills every prompt up front and then decodes in pure batches:",
+        (
+            "Offline trials, in one engine that prefills every prompt up front and then decodes in pure batches. "
+            "A server instead mixes the prefills of arriving requests into its decode batches, so offline speed "
+            "can rank configs differently than load does; attention backends in particular differ in how much a "
+            "prefill slows the decodes beside it."
+        ),
         "config | KL | tok/s | KV cache tokens",
     ]
     for r in session.run.records:
