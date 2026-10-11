@@ -117,6 +117,7 @@ def _prepare(run, ctx, args) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     from .load import load_goal, load_records
+    from .planner import plan_records
     from .probe import child_env, measured_env
     from .report import recommendation, render
     from .runner import HARNESS_SHA, Run
@@ -171,7 +172,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     searcher = Searcher(run, ctx, goal, env=env, timeout_s=args.trial_timeout)
     searcher.search(confirm_top=args.confirm_top, max_combos=args.max_combos)
-    (out / "report.md").write_text(render(run.meta, run.records, out, load_records(out), load_goal(out)))
+    (out / "report.md").write_text(
+        render(run.meta, run.records, out, load_records(out), load_goal(out), plan_records(out))
+    )
     best = recommendation(run.records, goal)
     if best:
         log.info("best     %s", best["label"])
@@ -188,6 +191,7 @@ def _trial_env(meta: dict) -> dict[str, str | None]:
 
 def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
+    from .planner import plan_records
     from .probe import child_env, measured_env, query_gpu
     from .report import render
     from .runner import HARNESS_SHA, Run
@@ -260,18 +264,33 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
     else:
         session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
-    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir), load_goal(args.run_dir))
+    text = render(
+        run.meta,
+        run.records,
+        args.run_dir,
+        load_records(args.run_dir),
+        load_goal(args.run_dir),
+        plan_records(args.run_dir),
+    )
     (args.run_dir / "report.md").write_text(text)
     log.info("report   %s", args.run_dir / "report.md")
 
 
 def cmd_report(args: argparse.Namespace) -> None:
     from .load import load_goal, load_records
+    from .planner import plan_records
     from .report import render
     from .runner import Run
 
     run = Run(args.run_dir)
-    text = render(run.meta, run.records, args.run_dir, load_records(args.run_dir), load_goal(args.run_dir))
+    text = render(
+        run.meta,
+        run.records,
+        args.run_dir,
+        load_records(args.run_dir),
+        load_goal(args.run_dir),
+        plan_records(args.run_dir),
+    )
     (args.run_dir / "report.md").write_text(text)
     print(text)
 

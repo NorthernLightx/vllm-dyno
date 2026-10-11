@@ -20,6 +20,7 @@ import logging
 import time
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
 
 import httpx
 
@@ -376,3 +377,11 @@ def plan(
 def _append(session: LoadSession, llm: Llm, entry: dict) -> None:
     with (session.run.path / "plan.jsonl").open("a") as f:
         f.write(json.dumps({"session": session.id, "model": llm.model, **entry}) + "\n")
+
+
+def plan_records(run_dir: Path) -> list[dict]:
+    """The lines of <run>/plan.jsonl, if any."""
+    path = run_dir / "plan.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]

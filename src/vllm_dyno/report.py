@@ -1,4 +1,4 @@
-"""report.md from run.json, trials.jsonl and load.jsonl."""
+"""report.md from run.json, trials.jsonl, load.jsonl and plan.jsonl."""
 
 from __future__ import annotations
 
@@ -228,7 +228,43 @@ def _commands(cand: Candidate, ctx: Context, run_dir: Path) -> list[str]:
     return lines
 
 
-def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] = (), load_goal: str = "chat") -> str:
+def _cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _plan_lines(picks: Sequence[dict]) -> list[str]:
+    models = ", ".join(f"`{m}`" for m in dict.fromkeys(p["model"] for p in picks))
+    lines = [
+        "",
+        "## Planner",
+        "",
+        (
+            f"{models} picked the configs to load after the baseline, in this order, with the gains it expected "
+            "before they ran. A combination it picked ran offline for quality before a server started."
+        ),
+        "",
+    ]
+    rows = [
+        [
+            str(i),
+            f"`{p['config']}`" if p["config"] else "stop",
+            f"{_ratio(p['expected_chat'])}, {_ratio(p['expected_batch'])}" if p["config"] else "",
+            _cell(p["result"]),
+            _cell(p["hypothesis"]),
+        ]
+        for i, p in enumerate(picks, 1)
+    ]
+    return lines + _table(["#", "config", "expected chat, batch", "measured", "hypothesis"], rows)
+
+
+def render(
+    meta: dict,
+    records: list[dict],
+    run_dir: Path,
+    load: Sequence[dict] = (),
+    load_goal: str = "chat",
+    picks: Sequence[dict] = (),
+) -> str:
     ctx = Context.from_json(meta["context"])
     goal = Goal(**meta["goal"])
     price = meta.get("gpu_price")
@@ -352,6 +388,9 @@ def render(meta: dict, records: list[dict], run_dir: Path, load: Sequence[dict] 
             "KL",
         ]
         lines += _table(header, rows)
+
+    if picks:
+        lines += _plan_lines(picks)
 
     singles = [r for r in records if r["stage"] == "screen" and len(candidate_of(r).changes()) == 1]
     if base_screen and base_screen["status"] == "ok" and singles:

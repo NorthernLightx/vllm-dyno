@@ -203,3 +203,24 @@ def test_the_load_section_names_the_sampling_requests_used(ctx, tmp_path, sampli
     load, records = loaded_run(ctx)
     text = render(meta(ctx), [*RECORDS, *records], tmp_path, [r | sampling for r in load], "chat")
     assert note in text
+
+
+def test_report_lists_the_planner_picks_with_expected_and_measured_gains(ctx, tmp_path):
+    picks = [
+        {
+            "model": "org/model",
+            "config": "weights=fp8",
+            "hypothesis": "fp8 | more KV",
+            "expected_chat": 1.1,
+            "expected_batch": 1.2,
+            "result": "chat 11.31 req/s (1.13x), batch 2500 tok/s (1.25x), KL 0.0120",
+        },
+        {"model": "org/model", "config": None, "hypothesis": "nothing left", "expected_chat": None, "result": "stop"},
+    ]
+    text = render(meta(ctx), RECORDS, tmp_path, picks=picks)
+    assert "`org/model` picked the configs to load after the baseline" in text
+    assert (
+        "| 1 | `weights=fp8` | 1.10x, 1.20x | chat 11.31 req/s (1.13x), batch 2500 tok/s (1.25x), KL 0.0120 "
+        r"| fp8 \| more KV |"
+    ) in text
+    assert "| 2 | stop |  | stop | nothing left |" in text
