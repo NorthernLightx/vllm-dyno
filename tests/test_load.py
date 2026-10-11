@@ -362,7 +362,7 @@ def test_search_loads_settings_within_quality_then_combines_those_that_gained(tm
     ]
 
 
-def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5) -> dict:
+def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, label: str = "weights=fp8") -> dict:
     """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran.
 
     Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline.
@@ -406,7 +406,7 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5) 
     monkeypatch.setattr(load, "chat_probe", fake_probe)
     monkeypatch.setattr(load, "batch_run", fake_batch)
     monkeypatch.setattr(load, "wait_idle", lambda url: None)
-    r = trial("screen", "weights=fp8", 0.007) | {"tpot_ms": 8.0}
+    r = trial("screen", label, 0.007) | {"tpot_ms": 8.0}
     record = load.measure_config(r, ctx, [[1]], Slo(), 30, env={}, out_dir=tmp_path, timeout_s=600)
     assert lone_params == [GREEDY, GREEDY]
     return record
@@ -439,6 +439,11 @@ def test_a_server_that_decodes_a_lone_request_much_slower_than_offline_is_not_me
         "a lone request decoded at 94.1 ms per token, against 8.0 ms offline",
     )
     assert "capacity_rps" not in record and "batch" not in record
+
+
+def test_speculative_configs_decode_lone_requests_at_a_speed_the_check_cannot_judge(tmp_path, monkeypatch, ctx):
+    record = measure(tmp_path, monkeypatch, ctx, 8.9, lone=94.1, label="speculative=ngram")
+    assert (record["status"], record["lone_tpot_ms"]) == ("ok", 94.1)
 
 
 def test_a_degraded_config_gains_nothing_and_does_not_count_as_the_same_engine(tmp_path, monkeypatch, ctx):

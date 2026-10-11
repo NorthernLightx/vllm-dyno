@@ -28,6 +28,8 @@ The capacity search assumes the server serves as fast as the GPU lets it, from s
 two checks mark a record degraded, which keeps it out of gains and the recommendation. Before the
 search, requests sent one at a time and decoded greedily, as the offline engine decodes, must not
 run DEGRADED_TPOT times slower than that engine did; a server that does is not measured further.
+Speculative configs are exempt: how fast they decode depends on how much of the text their drafts
+guess, and these requests' text is not the offline engine's.
 After batch the server is probed at START_RATE again, and its TPOT p50 must stay within
 DEGRADED_TPOT times the first probe's: a server that overflowed GPU memory into system memory
 stays slow until it restarts.
@@ -499,7 +501,7 @@ def measure_config(
             log.info(
                 "load     %-55s lone request: TPOT %s ms, %.1f ms offline", r["label"], _f(lone_ms, ".1f"), r["tpot_ms"]
             )
-            if slow := slow_start(r["tpot_ms"], lone_ms):
+            if cand.speculative == "none" and (slow := slow_start(r["tpot_ms"], lone_ms)):
                 raise ServerFailed("degraded", slow)
 
             def passes(rate: float) -> bool:
