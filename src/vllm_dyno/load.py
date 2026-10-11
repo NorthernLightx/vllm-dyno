@@ -16,18 +16,21 @@ Every request carries its own cache_salt, so prompts from the pool can repeat wi
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
 offline engine's: below 70 GiB of GPU memory, max_num_batched_tokens is 2048 instead of 8192.
 
-Requests leave sampling to the server, which applies the model's generation_config as it would
-for any client that sets nothing, so the penalties and top-k/top-p a model asks for are part of
+Measured requests leave sampling to the server, which applies the model's generation_config as it
+would for any client that sets nothing, so the penalties and top-k/top-p a model asks for are part of
 what is measured.
 
 Each `dyno load` is a session that measures the baseline first, and gains are against the
 baseline of the same session, because load results drift between sessions by more than most
 settings change them.
 
-After batch the server is probed once more at START_RATE, because the capacity search assumes it
-serves as fast at the end as at the start; a server that overflowed GPU memory into system memory
-stays slow until it restarts. A recheck TPOT p50 above DEGRADED_TPOT times the first probe's marks
-the record degraded, which keeps it out of gains and the recommendation.
+The capacity search assumes the server serves as fast as the GPU lets it, from start to end, so
+two checks mark a record degraded, which keeps it out of gains and the recommendation. Before the
+search, requests sent one at a time and decoded greedily, as the offline engine decodes, must not
+run DEGRADED_TPOT times slower than that engine did; a server that does is not measured further.
+After batch the server is probed at START_RATE again, and its TPOT p50 must stay within
+DEGRADED_TPOT times the first probe's: a server that overflowed GPU memory into system memory
+stays slow until it restarts.
 
 <run>/load.json      SLO and settings; a resumed load must match them
 <run>/load.jsonl     one line per config and session
@@ -78,9 +81,11 @@ SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`:
 # smaller gains are within noise: a repeated measurement can land one bisection step apart,
 # and the steps find_capacity takes near the limit are up to 9% wide
 LOAD_MIN_GAIN = 0.1
-# the recheck's TPOT p50 over the first probe's, above which the server slowed down during its
-# measurement; at START_RATE the server is nearly idle, so its TPOT hardly varies otherwise
+# a lone request's TPOT over the offline engine's, or the recheck's TPOT p50 over the first probe's,
+# above which the server is degraded; HTTP streaming, and the few requests that share a step at
+# START_RATE, slow decoding by less than that
 DEGRADED_TPOT = 1.5
+GREEDY = {"temperature": 0.0, "repetition_penalty": 1.0}  # how the offline engine decodes
 QUEUE = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
 KV_USAGE = {"vllm:kv_cache_usage_perc"}
 PREEMPTIONS = {"vllm:num_preemptions_total"}
@@ -126,8 +131,10 @@ def poisson_starts(rate: float, n: int, seed: int = 0) -> list[float]:
     return starts
 
 
-async def stream_one(client: httpx.AsyncClient, model: str, prompt: list[int], max_tokens: int) -> Timing:
-    """Send one streamed completion; time its first token and the tokens after it."""
+async def stream_one(
+    client: httpx.AsyncClient, model: str, prompt: list[int], max_tokens: int, params: dict | None = None
+) -> Timing:
+    """Send one streamed completion, with sampling params if any; time its first token and the tokens after it."""
     body = {
         "model": model,
         "prompt": prompt,
@@ -136,6 +143,7 @@ async def stream_one(client: httpx.AsyncClient, model: str, prompt: list[int], m
         "stream": True,
         "stream_options": {"include_usage": True},
         "cache_salt": uuid.uuid4().hex,
+        **(params or {}),
     }
     t0 = time.perf_counter()
     first, tokens = None, 0
@@ -199,6 +207,7 @@ async def send(
     *,
     watch_server: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
+    params: dict | None = None,
 ) -> Sent:
     """Send prompts[i] at starts[i] seconds. With an SLO, stop once too many requests have missed it."""
     limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
@@ -210,7 +219,7 @@ async def send(
 
         async def one(prompt: list[int], start: float) -> Timing:
             await asyncio.sleep(max(0.0, t0 + start - time.perf_counter()))
-            return await stream_one(client, model, prompt, max_tokens)
+            return await stream_one(client, model, prompt, max_tokens, params)
 
         tasks = [asyncio.create_task(one(p, s)) for p, s in zip(prompts, starts)]
         allowed = len(tasks) - slo.needed(len(tasks)) if slo else len(tasks)
@@ -357,6 +366,13 @@ def _bisect(probe: Callable[[float], bool], lo: float, hi: float) -> tuple[float
     return lo, hi
 
 
+def slow_start(offline_ms: float, lone_ms: float | None) -> str | None:
+    """How a server decoded requests sent one at a time slower than the same engine offline; None if within DEGRADED_TPOT."""
+    if lone_ms is None or lone_ms <= DEGRADED_TPOT * offline_ms:
+        return None
+    return f"a lone request decoded at {lone_ms:.1f} ms per token, against {offline_ms:.1f} ms offline"
+
+
 def slowdown(first: dict, recheck: dict) -> str | None:
     """How the server slowed down between its first probe and the recheck after batch; None if it did not."""
     before, after = first["tpot_p50_ms"], recheck["tpot_p50_ms"]
@@ -477,6 +493,14 @@ def measure_config(
             kv, backends = KV_LINE.search(started_log), attention_backends(started_log)
             sampling = SAMPLING_LINE.search(started_log)
             asyncio.run(send(url, model, pool[:4], [0.0] * 4, 16))  # first requests pay one-off setup costs
+            # the faster of two, so a kernel compiled on first use does not decide
+            lone = [asyncio.run(send(url, model, pool[:1], [0.0], OUTPUT_LEN, params=GREEDY)) for _ in range(2)]
+            lone_ms = min((t.tpot_s * 1000 for s in lone for t in s.timings if t.error is None), default=None)
+            log.info(
+                "load     %-55s lone request: TPOT %s ms, %.1f ms offline", r["label"], _f(lone_ms, ".1f"), r["tpot_ms"]
+            )
+            if slow := slow_start(r["tpot_ms"], lone_ms):
+                raise ServerFailed("degraded", slow)
 
             def passes(rate: float) -> bool:
                 p = chat_probe(url, model, pool, rate, slo, probe_s)
@@ -532,6 +556,7 @@ def measure_config(
         "kv_tokens": int(kv.group(1).replace(",", "")) if kv else None,
         "backend": backends,
         "sampling": sampling.group(1) if sampling else None,  # None: vLLM's own defaults
+        "lone_tpot_ms": lone_ms,
         "capacity_rps": lo,
         "capped": hi is None,
         "chat": at_capacity,

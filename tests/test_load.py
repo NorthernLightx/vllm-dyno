@@ -8,8 +8,10 @@ import pytest
 
 from vllm_dyno import load
 from vllm_dyno.load import (
+    GREEDY,
     QUEUE,
     LoadSession,
+    Sent,
     Slo,
     Timing,
     find_capacity,
@@ -55,6 +57,18 @@ def test_requests_send_token_ids_each_with_its_own_cache_salt_and_leave_sampling
     assert all(b["ignore_eos"] and b["stream"] for b in bodies)
     assert not {"temperature", "top_k", "top_p", "repetition_penalty"} & {k for b in bodies for k in b}
     assert bodies[0]["cache_salt"] != bodies[1]["cache_salt"]
+
+
+def test_the_health_check_decodes_greedily_like_the_offline_engine():
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=completion(8))
+
+    transport = httpx.MockTransport(handler)
+    asyncio.run(send("http://server", "org/base", [[1]], [0.0], 8, transport=transport, params=GREEDY))
+    assert {k: bodies[0][k] for k in GREEDY} == GREEDY == {"temperature": 0.0, "repetition_penalty": 1.0}
 
 
 def test_http_errors_and_short_streams_are_errors():
@@ -348,17 +362,22 @@ def test_search_loads_settings_within_quality_then_combines_those_that_gained(tm
     ]
 
 
-def measure(tmp_path, monkeypatch, ctx, after: float | None) -> dict:
-    """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran."""
-    batched = []
+def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5) -> dict:
+    """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran.
+
+    Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline.
+    """
+    batched, lone_params = [], []
 
     @contextlib.contextmanager
     def fake_serving(argv, log_path, env, timeout_s):
         log_path.write_text("GPU KV cache size: 44,624 tokens\n")
         yield "http://server"
 
-    async def fake_send(*args, **kwargs):
-        pass
+    async def fake_send(url, model, prompts, starts, max_tokens, slo=None, *, params=None, **kwargs):
+        if max_tokens == load.OUTPUT_LEN:  # the warmup asks for fewer
+            lone_params.append(params)
+        return Sent([Timing(0.05, lone / 1000, max_tokens)] * len(prompts), 1.0, 0.0)
 
     def fake_probe(url, model, pool, rate, slo, probe_s):
         n, tpot = 60, after if batched else 8.9
@@ -387,8 +406,10 @@ def measure(tmp_path, monkeypatch, ctx, after: float | None) -> dict:
     monkeypatch.setattr(load, "chat_probe", fake_probe)
     monkeypatch.setattr(load, "batch_run", fake_batch)
     monkeypatch.setattr(load, "wait_idle", lambda url: None)
-    r = trial("screen", "weights=fp8", 0.007)
-    return load.measure_config(r, ctx, [[1]], Slo(), 30, env={}, out_dir=tmp_path, timeout_s=600)
+    r = trial("screen", "weights=fp8", 0.007) | {"tpot_ms": 8.0}
+    record = load.measure_config(r, ctx, [[1]], Slo(), 30, env={}, out_dir=tmp_path, timeout_s=600)
+    assert lone_params == [GREEDY, GREEDY]
+    return record
 
 
 @pytest.mark.parametrize(
@@ -407,7 +428,17 @@ def test_a_server_slower_after_batch_than_at_its_first_probe_is_degraded(
     assert (record["recheck"]["rate"], record["recheck"]["tpot_p50_ms"]) == (load.START_RATE, after)
     # a degraded record keeps its numbers for diagnosis
     assert record["capacity_rps"] == pytest.approx(20, rel=load.PRECISION)
-    assert (record["batch"]["tput_tok_s"], record["kv_tokens"]) == (2900, 44624)
+    assert (record["batch"]["tput_tok_s"], record["kv_tokens"], record["lone_tpot_ms"]) == (2900, 44624, 8.5)
+
+
+def test_a_server_that_decodes_a_lone_request_much_slower_than_offline_is_not_measured(tmp_path, monkeypatch, ctx):
+    assert measure(tmp_path, monkeypatch, ctx, 8.9, lone=11.9)["status"] == "ok"  # 1.49x offline
+    record = measure(tmp_path, monkeypatch, ctx, 8.9, lone=94.1)
+    assert (record["status"], record["error"]) == (
+        "degraded",
+        "a lone request decoded at 94.1 ms per token, against 8.0 ms offline",
+    )
+    assert "capacity_rps" not in record and "batch" not in record
 
 
 def test_a_degraded_config_gains_nothing_and_does_not_count_as_the_same_engine(tmp_path, monkeypatch, ctx):
