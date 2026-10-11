@@ -75,7 +75,9 @@ def endpoint(responses: list[httpx.Response], sent: list[httpx.Request]) -> http
 
 
 def answer(content: str) -> httpx.Response:
-    return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": content}}]})
+    message = {"role": "assistant", "content": content}
+    usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+    return httpx.Response(200, json={"choices": [{"message": message}], "usage": usage})
 
 
 def test_the_endpoint_is_asked_again_while_it_is_rate_limited(monkeypatch):
@@ -88,7 +90,8 @@ def test_the_endpoint_is_asked_again_while_it_is_rate_limited(monkeypatch):
         answer("{}"),
     ]
     llm = Llm("https://example.org/api/v1", "org/model:free", "secret", transport=endpoint(responses, sent))
-    assert llm.complete([{"role": "user", "content": "hi"}]) == "{}"
+    reply = llm.complete([{"role": "user", "content": "hi"}])
+    assert (reply.text, reply.usage["completion_tokens"]) == ("{}", 10)
     assert waits == [3.0, 30.0]
     assert str(sent[0].url) == "https://example.org/api/v1/chat/completions"
     assert sent[0].headers["authorization"] == "Bearer secret"
@@ -186,6 +189,7 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
     ]
     assert journal[0]["result"] == "chat 12.00 req/s (1.20x), batch 1000 tok/s (1.00x), KL 0.0006"
     assert journal[1]["result"] == "KL 0.0600 offline, over the limit; no server started"
+    assert journal[3]["tokens"] == {"prompt_tokens": 200, "completion_tokens": 20}  # the refused stop counts
     first = json.loads(sent[0].content)["messages"][1]["content"]
     assert "Settings no loaded config has changed yet: weights, kv_cache_dtype, attention_backend." in first
     refused = json.loads(sent[4].content)["messages"]

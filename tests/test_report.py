@@ -214,8 +214,16 @@ def test_report_lists_the_planner_picks_with_expected_and_measured_gains(ctx, tm
             "expected_chat": 1.1,
             "expected_batch": 1.2,
             "result": "chat 11.31 req/s (1.13x), batch 2500 tok/s (1.25x), KL 0.0120",
+            "tokens": {"prompt_tokens": 2100, "completion_tokens": 150},
         },
-        {"model": "org/model", "config": None, "hypothesis": "nothing left", "expected_chat": None, "result": "stop"},
+        {
+            "model": "org/model",
+            "config": None,
+            "hypothesis": "nothing left",
+            "expected_chat": None,
+            "result": "stop",
+            "tokens": {"prompt_tokens": 2400, "completion_tokens": 90},
+        },
     ]
     text = render(meta(ctx), RECORDS, tmp_path, picks=picks)
     assert "`org/model` picked the configs to load after the baseline" in text
@@ -224,3 +232,4 @@ def test_report_lists_the_planner_picks_with_expected_and_measured_gains(ctx, tm
         r"| fp8 \| more KV |"
     ) in text
     assert "| 2 | stop |  | stop | nothing left |" in text
+    assert "The endpoint counted 4,500 prompt tokens and 240 completion tokens." in text

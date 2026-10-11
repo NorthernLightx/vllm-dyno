@@ -12,8 +12,8 @@ can misjudge a setting under load, and a model that judges by it stops before lo
 If the endpoint fails, or answers twice with something outside the list, the rules finish the session,
 reusing every config already loaded.
 
-<run>/plan.jsonl     one line per pick: hypothesis, expected and measured gains
-<run>/plan/*.json    the messages sent and the replies of each step
+<run>/plan.jsonl     one line per pick: hypothesis, expected and measured gains, tokens
+<run>/plan/*.json    the messages sent, and the replies of each step with their token usage
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 
 RETRIES = 4
 MAX_WAIT_S = 120
+TOKENS = ("prompt_tokens", "completion_tokens")
 
 SYSTEM = """\
 You choose which vLLM serving config to measure next on one GPU, to find the config that serves a traffic \
@@ -64,6 +65,12 @@ class PlannerError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Reply:
+    text: str
+    usage: dict  # token counts as the endpoint reports them, such as prompt_tokens; empty if it reports none
+
+
 def take_key(env: MutableMapping[str, str], name: str) -> str | None:
     """The value of variable name, removed from env so that processes started with env do not inherit it."""
     return env.pop(name, None) or None
@@ -79,7 +86,7 @@ class Llm:
     timeout_s: float = 300
     transport: httpx.BaseTransport | None = None
 
-    def complete(self, messages: list[dict]) -> str:
+    def complete(self, messages: list[dict]) -> Reply:
         """The reply to messages, retried while the endpoint is rate limited or unavailable."""
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         # Only what every endpoint accepts: Claude models from 4.7 on refuse a temperature below 1, and
@@ -99,7 +106,7 @@ class Llm:
                     except ValueError:
                         data = {}
                     if resp.status_code == 200 and data.get("choices"):
-                        return data["choices"][0]["message"].get("content") or ""
+                        return Reply(data["choices"][0]["message"].get("content") or "", data.get("usage") or {})
                     # OpenRouter can answer 200 with the provider's error in the body
                     code = (data.get("error") or {}).get("code", resp.status_code)
                     problem = f"HTTP {code}: {resp.text[:300]}"
@@ -281,7 +288,7 @@ def brief(
 
 
 def propose(
-    llm: Llm, messages: list[dict], options: list[Candidate], untried: Sequence[str], transcript: list[str]
+    llm: Llm, messages: list[dict], options: list[Candidate], untried: Sequence[str], transcript: list[Reply]
 ) -> Proposal:
     """Ask for a pick, and once more if the reply names nothing allowed or stops too early. Replies go to transcript."""
     problem = ""
@@ -289,12 +296,12 @@ def propose(
         reply = llm.complete(messages)
         transcript.append(reply)
         try:
-            return parse(reply, options, untried)
+            return parse(reply.text, options, untried)
         except ValueError as e:
             problem = str(e)
         messages = [
             *messages,
-            {"role": "assistant", "content": reply},
+            {"role": "assistant", "content": reply.text},
             {"role": "user", "content": f"{problem}. Answer again with one JSON object, as the system message says."},
         ]
     raise PlannerError(f"{llm.model} answered twice with no allowed config or stop: {problem}")
@@ -373,20 +380,21 @@ def plan(
                 "content": brief(session, goal, target, journal, options, left, max_servers - servers, max_servers),
             },
         ]
-        replies: list[str] = []
+        replies: list[Reply] = []
         step_file = steps_dir / f"{session.id}-{len(journal) + 1:02d}.json"
         try:
             p = propose(llm, messages, options, left, replies)
         except PlannerError as e:
-            step_file.write_text(json.dumps({"messages": messages, "replies": replies, "error": str(e)}, indent=2))
+            step_file.write_text(_step(messages, replies, error=str(e)))
             log.warning("plan     %s; the rules finish the session", e)
             session.search(goal, max_combos, trial_timeout_s)
             return
-        step_file.write_text(json.dumps({"messages": messages, "replies": replies}, indent=2))
+        step_file.write_text(_step(messages, replies))
+        tokens = {k: sum(int(r.usage.get(k) or 0) for r in replies) for k in TOKENS}
         if p.config is None:
             log.info("plan     %s stops: %s", llm.model, p.hypothesis)
             entry = {"config": None, "hypothesis": p.hypothesis, "expected_chat": None, "expected_batch": None}
-            _append(session, llm, entry | {"result": "stop", "server": False})
+            _append(session, llm, entry | {"result": "stop", "server": False, "tokens": tokens})
             return
         label = p.config.label()
         log.info(
@@ -410,10 +418,16 @@ def plan(
             "expected_batch": p.expected_batch,
             "result": result,
             "server": started,
+            "tokens": tokens,
         }
         journal.append(entry)
         _append(session, llm, entry)
     log.info("plan     %d of %d servers started", servers, max_servers)
+
+
+def _step(messages: list[dict], replies: list[Reply], **extra: str) -> str:
+    texts, usage = [r.text for r in replies], [r.usage for r in replies]
+    return json.dumps({"messages": messages, "replies": texts, "usage": usage, **extra}, indent=2)
 
 
 def _append(session: LoadSession, llm: Llm, entry: dict) -> None:

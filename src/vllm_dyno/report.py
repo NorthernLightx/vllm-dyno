@@ -15,6 +15,7 @@ from .load import (
     gains,
     session_baseline,
 )
+from .planner import TOKENS
 from .probe import serve_env
 from .search import Goal, candidate_of
 from .space import Candidate, Context, serve_command
@@ -254,7 +255,12 @@ def _plan_lines(picks: Sequence[dict]) -> list[str]:
         ]
         for i, p in enumerate(picks, 1)
     ]
-    return lines + _table(["#", "config", "expected chat, batch", "measured", "hypothesis"], rows)
+    lines += _table(["#", "config", "expected chat, batch", "measured", "hypothesis"], rows)
+    counted = [p["tokens"] for p in picks if p.get("tokens")]
+    if counted:
+        prompt, completion = (sum(t[k] for t in counted) for k in TOKENS)
+        lines += ["", f"The endpoint counted {prompt:,} prompt tokens and {completion:,} completion tokens."]
+    return lines
 
 
 def render(
