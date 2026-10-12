@@ -43,7 +43,7 @@ from .planner import Llm, Proposal
 from .report import _table, load_recommendation, quality
 from .runner import Run, trial_key
 from .search import Goal, candidate_of
-from .space import Candidate, Context
+from .space import DEFAULTS, KNOBS, Candidate, Context
 
 if TYPE_CHECKING:
     from .planner import Proposer, Step  # ty: ignore[unresolved-import]
@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 TRIAL_TIMEOUT_S = 900  # handed to the search; no trial runs
+OPTUNA_STARTUP = 3  # TPE samples at random until this many trials finished, the baseline among them
+OPTUNA_QUEUED = 3  # configs with the best offline estimate, measured before TPE picks
+OPTUNA_ASKS = 100  # answers to configs already measured before a step draws at random instead
+OTHER_WEIGHT = 0.1  # weight of the other profile's log gain in the score TPE maximises
+SMALLEST_GAIN = 1e-3  # stands in for no capacity at all, whose log is undefined
 
 Drive = Callable[[LoadSession, int], None]  # runs one session; the int seeds its planner
 
@@ -357,6 +362,113 @@ class RandomProposer:
         return Proposal(self.rng.choice(step.options), "drawn at random from the configs left")
 
 
+def _candidate(label: str) -> Candidate:
+    return Candidate(**dict(kv.split("=", 1) for kv in label.split())) if label != "baseline" else Candidate()
+
+
+def _score(chat: float, batch: float, target: str) -> float:
+    first, other = (chat, batch) if target == "chat" else (batch, chat)
+    return math.log(max(first, SMALLEST_GAIN)) + OTHER_WEIGHT * math.log(max(other, SMALLEST_GAIN))
+
+
+INFEASIBLE = _score(SMALLEST_GAIN, SMALLEST_GAIN, "chat")
+
+
+class OptunaProposer:
+    """Optuna's TPE sampler over the four settings, asked for one config per step and never stopping.
+
+    The study is rebuilt at every step from the run's load records and this session's picks, so the
+    proposer keeps no state. TPE maximises one score, the log gain on the target profile plus
+    OTHER_WEIGHT times the log gain on the other; the session's recommendation still comes from its
+    records. A config that failed offline, went over the KL limit or whose server failed is
+    infeasible, and a config skipped as the same engine as a loaded one scores as that one.
+    The OPTUNA_QUEUED configs with the highest offline estimate, the product of their settings'
+    offline throughput gains, are measured first. TPE proposes configs it has seen; each is told its
+    score again, and after OPTUNA_ASKS of those the step draws a config at random.
+    """
+
+    name = "optuna"
+
+    def __init__(self, seed: int = 0) -> None:
+        try:
+            import optuna
+        except ImportError:
+            raise SystemExit(
+                "the optuna planner needs Optuna; install the bench extra: uv sync --extra bench"
+            ) from None
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        self.seed = seed
+
+    def propose(self, step: Step) -> Proposal:
+        """The next config TPE asks for among step.options."""
+        import optuna
+        from optuna.distributions import BaseDistribution, CategoricalDistribution
+        from optuna.trial import create_trial
+
+        known = self._known(step)
+        cands = [*step.options, *(c for c in known if c not in step.options)]
+        dists: dict[str, BaseDistribution] = {
+            k: CategoricalDistribution(sorted({DEFAULTS[k], *(getattr(c, k) for c in cands)})) for k in KNOBS
+        }
+        sampler = optuna.samplers.TPESampler(seed=self.seed + len(step.journal), n_startup_trials=OPTUNA_STARTUP)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        for cand, (score, feasible) in known.items():
+            constraint = {"runs": 0.0 if feasible else 1.0}
+            study.add_trial(create_trial(params=asdict(cand), distributions=dists, value=score, constraints=constraint))
+        estimate = _offline_estimate(step.session.run.records)
+        queued = sorted((c for c in cands if c.changes()), key=lambda c: (-estimate(c), c.label()))[:OPTUNA_QUEUED]
+        for cand in queued:
+            if cand in step.options:
+                study.enqueue_trial(asdict(cand))
+        for _ in range(OPTUNA_ASKS):
+            trial = study.ask(dists)
+            cand = Candidate(**trial.params)
+            if cand in step.options:
+                why = "among the best offline" if cand in queued else "TPE's pick"
+                return Proposal(cand, why)
+            score, feasible = known.get(cand, (INFEASIBLE, False))
+            trial.set_constraint("runs", 0.0 if feasible else 1.0)
+            study.tell(trial, score)
+        rng = random.Random(self.seed + len(step.journal))
+        return Proposal(
+            rng.choice(step.options), f"TPE asked for measured configs {OPTUNA_ASKS} times; drawn at random"
+        )
+
+    def _known(self, step: Step) -> dict[Candidate, tuple[float, bool]]:
+        """Score and feasibility of every config measured or tried so far."""
+        known: dict[Candidate, tuple[float, bool]] = {}
+        load_ = load_records(step.session.run.path)
+        for r in load_:
+            chat, batch = gains(r, session_baseline(load_, r))
+            if chat is not None and batch is not None:
+                known[candidate_of(r)] = (_score(chat, batch, step.target), True)
+            else:
+                known.setdefault(candidate_of(r), (INFEASIBLE, False))
+        trials = [r for r in step.session.run.records if r["stage"] in ("screen", "combine")]
+        for r in trials:  # a single that failed offline added no value to the search space
+            if r["stage"] == "combine" and (r["status"] != "ok" or r["kl"] > step.goal.max_kl):
+                known.setdefault(candidate_of(r), (INFEASIBLE, False))
+        for j in step.journal:
+            cand = _candidate(j["config"])
+            if cand in known:
+                continue
+            r = next((r for r in trials if r["label"] == j["config"] and r["status"] == "ok"), None)
+            twin = step.session.same_engine(r) if r else None
+            known[cand] = known.get(_candidate(twin), (INFEASIBLE, False)) if twin else (INFEASIBLE, False)
+        return known
+
+
+def _offline_estimate(records: list[dict]) -> Callable[[Candidate], float]:
+    """A config's offline throughput over the baseline's, as the product of its settings' gains on their own."""
+    base = next(r for r in records if r["stage"] == "screen" and r["label"] == "baseline")
+    single = {
+        next(iter(candidate_of(r).changes().items())): r["tput_tok_s"] / base["tput_tok_s"]
+        for r in records
+        if r["stage"] == "screen" and r["status"] == "ok" and len(candidate_of(r).changes()) == 1
+    }
+    return lambda cand: math.prod(single.get(item, 1.0) for item in cand.changes().items())
+
+
 def proposer(name: str, seed: int, llm: Llm | None) -> Proposer:
     """A fresh proposer of the named planner, other than rules."""
     if name == "llm":
@@ -371,6 +483,8 @@ def proposer(name: str, seed: int, llm: Llm | None) -> Proposer:
         return planner.AllProposer()  # ty: ignore[unresolved-attribute]
     if name == "random":
         return RandomProposer(seed)
+    if name == "optuna":
+        return OptunaProposer(seed)
     raise ValueError(f"unknown planner {name!r}")
 
 

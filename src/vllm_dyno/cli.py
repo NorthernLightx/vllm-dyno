@@ -511,9 +511,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     replay.add_argument(
         "--planner",
-        choices=["rules", "llm", "fit", "all", "random"],
+        choices=["rules", "llm", "fit", "all", "random", "optuna"],
         default="rules",
-        help="rules: as dyno load; all: allowed configs in order, up to --max-servers",
+        help="rules: as dyno load; all: allowed configs in order, up to --max-servers; optuna needs the bench extra",
     )
     replay.add_argument("--repeats", type=int, default=100, help="sessions to replay")
     replay.add_argument(

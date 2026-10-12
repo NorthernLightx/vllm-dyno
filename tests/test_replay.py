@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from dataclasses import asdict
 
 import httpx
@@ -274,6 +275,28 @@ def test_runs_measured_with_other_load_code_are_not_pooled(tmp_path, ctx):
     expected = f"{ours} and {theirs} were measured differently (load code {load.LOAD_SHA} against 000000000000)"
     with pytest.raises(SystemExit, match=re.escape(expected)):
         replay.recorded([ours, theirs])
+
+
+def test_optuna_loads_the_configs_best_offline_first_then_what_tpe_asks_for(tmp_path, monkeypatch, ctx):
+    pytest.importorskip("optuna")
+    path = rules_run(tmp_path, monkeypatch, ctx)
+
+    def run() -> dict:
+        return replay.replay([path], "optuna", repeats=2, max_servers=4, max_combos=8, seed=0, target="chat")
+
+    result = run()
+    assert result == run()
+    for o in result["repeats"]:
+        # fp8 with int8 KV and TRITON_ATTN is queued second, and skipped as the engine fp8 with int8 KV ran
+        assert o["loaded"][:3] == ["baseline", FP8_INT8, "weights=fp8"]
+        assert (o["servers"], o["gap"]) == (4, None)
+        assert len(set(o["loaded"])) == len(o["loaded"])
+
+
+def test_the_optuna_planner_names_the_extra_it_needs(monkeypatch):
+    monkeypatch.setitem(sys.modules, "optuna", None)
+    with pytest.raises(SystemExit, match="install the bench extra"):
+        replay.OptunaProposer(0)
 
 
 def test_random_loads_any_config_left_until_its_budget_is_spent(tmp_path, monkeypatch, ctx):
