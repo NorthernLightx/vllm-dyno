@@ -334,6 +334,41 @@ def cmd_load(args: argparse.Namespace) -> None:
     log.info("report   %s", args.run_dir / "report.md")
 
 
+def cmd_replay(args: argparse.Namespace) -> None:
+    from .planner import Llm, take_key
+    from .replay import markdown, replay
+
+    key = take_key(os.environ, args.planner_key_env)
+    llm = None
+    if args.planner == "llm":
+        if key is None and not _local(args.planner_url):
+            raise SystemExit(f"{args.planner_url} needs an API key; set {args.planner_key_env}")
+        llm = Llm(args.planner_url, args.planner_model, key)
+    _setup_logging(None)
+    # the replayed sessions log each step they take, as dyno load does
+    logging.getLogger("vllm_dyno").setLevel(logging.WARNING)
+    logging.getLogger("vllm_dyno.replay").setLevel(logging.INFO)
+    if llm:
+        log.warning(
+            "replay   %s answers every step of %d repeats, each request billed as in dyno load",
+            args.planner_model,
+            args.repeats,
+        )
+    result = replay(
+        args.run_dirs,
+        args.planner,
+        repeats=args.repeats,
+        max_servers=args.max_servers,
+        max_combos=args.max_combos,
+        seed=args.seed,
+        target=args.goal,
+        llm=llm,
+    )
+    if args.out:
+        args.out.write_text(json.dumps(result, indent=2))
+    print(markdown(result))
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     from .load import load_goal, load_records
     from .planner import plan_records
@@ -464,6 +499,44 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument("--probe-seconds", type=float, default=30, help="arrival window of each chat probe")
     load.add_argument("--server-timeout", type=float, default=600, help="seconds to wait for vllm serve to answer")
     load.set_defaults(func=cmd_load)
+
+    replay = sub.add_parser(
+        "replay", help="run a planner many times against the load records of finished runs, without a GPU"
+    )
+    replay.add_argument(
+        "run_dirs",
+        nargs="+",
+        type=Path,
+        help="runs measured the same way; every session starts from the offline trials of the first",
+    )
+    replay.add_argument(
+        "--planner",
+        choices=["rules", "llm", "fit", "all", "random"],
+        default="rules",
+        help="rules: as dyno load; all: allowed configs in order, up to --max-servers",
+    )
+    replay.add_argument("--repeats", type=int, default=100, help="sessions to replay")
+    replay.add_argument(
+        "--max-servers", type=int, default=10, help="configs a planner other than rules may load after the baseline"
+    )
+    replay.add_argument("--max-combos", type=int, default=8, help="combinations the rules load")
+    replay.add_argument("--seed", type=int, default=0, help="seeds the records drawn and the planners that draw")
+    replay.add_argument(
+        "--goal", choices=["chat", "batch"], default="chat", help="traffic profile to recommend a config for"
+    )
+    replay.add_argument(
+        "--planner-url", default="https://openrouter.ai/api/v1", help="OpenAI-compatible endpoint of the llm planner"
+    )
+    replay.add_argument(
+        "--planner-model", default="nvidia/nemotron-3-super-120b-a12b:free", help="model id at that endpoint"
+    )
+    replay.add_argument(
+        "--planner-key-env",
+        default="OPENROUTER_API_KEY",
+        help="environment variable holding the endpoint's API key; unset or empty sends none",
+    )
+    replay.add_argument("--out", type=Path, help="write the truth, every repeat and the summary here as JSON")
+    replay.set_defaults(func=cmd_replay)
 
     report = sub.add_parser("report", help="rewrite and print report.md for a run directory")
     report.add_argument("run_dir", type=Path)
