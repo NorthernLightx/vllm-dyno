@@ -7,7 +7,7 @@ import shlex
 import pytest
 
 from vllm_dyno import data
-from vllm_dyno.load import KV_LINE, OUTPUT_LEN, Slo, batch_run, chat_probe, prompt_pool, send, serving
+from vllm_dyno.load import KV_LINE, OUTPUT_LEN, Slo, batch_run, chat_probe, prompt_pool, send, serving, warm_up
 from vllm_dyno.probe import AttentionShape, child_env, host_facts, memory_utilization, model_files, query_gpu
 from vllm_dyno.runner import Run, run_trial
 from vllm_dyno.search import POOL_SIZE, SCREEN
@@ -52,6 +52,7 @@ def test_vllm_serve_answers_requests_a_chat_probe_and_a_batch(tmp_path):
     log_path = tmp_path / "server.log"
     with serving(shlex.split(serve_command(Candidate(), ctx)), log_path, child_env(ctx.host, ctx.util), 600) as url:
         assert KV_LINE.search(log_path.read_text())
+        warm_up(url, model, pool)  # as dyno load does: a sampler kernel compiled mid-probe fails it
         sent = asyncio.run(send(url, model, pool[:2], [0.0, 0.0], OUTPUT_LEN))
         probe = chat_probe(url, model, pool, 2.0, Slo(), 5)
         batch = batch_run(url, model, pool, 32)
