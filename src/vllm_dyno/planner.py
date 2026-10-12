@@ -112,10 +112,13 @@ class Llm:
                         data = resp.json()
                     except ValueError:
                         data = {}
+                    if not isinstance(data, dict):
+                        data = {}
                     if resp.status_code == 200 and data.get("choices"):
                         return Reply(data["choices"][0]["message"].get("content") or "", data.get("usage") or {})
-                    # OpenRouter can answer 200 with the provider's error in the body
-                    code = (data.get("error") or {}).get("code", resp.status_code)
+                    # OpenRouter can answer 200 with the provider's error in the body; not every error is an object
+                    error = data.get("error")
+                    code = error.get("code", resp.status_code) if isinstance(error, dict) else resp.status_code
                     problem = f"HTTP {code}: {resp.text[:300]}"
                     if code != 429 and not (isinstance(code, int) and code >= 500):
                         raise PlannerError(problem)

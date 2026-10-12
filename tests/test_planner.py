@@ -113,6 +113,20 @@ def test_an_endpoint_that_refuses_the_request_is_not_asked_again():
     assert len(sent) == 1 and "authorization" not in sent[0].headers
 
 
+@pytest.mark.parametrize("body", [[{"error": {"code": 502}}], {"error": "upstream request failed"}])
+def test_a_body_that_is_an_array_or_holds_a_string_error_fails_as_its_status_says(monkeypatch, body):
+    sent: list[httpx.Request] = []
+    llm = Llm("https://example.org/v1", "m", transport=endpoint([httpx.Response(200, json=body)], sent))
+    with pytest.raises(PlannerError, match="HTTP 200"):
+        llm.complete([])
+    assert len(sent) == 1
+    waits: list[float] = []
+    monkeypatch.setattr(planner.time, "sleep", waits.append)
+    responses = [httpx.Response(503, json=body), answer("{}")]
+    assert Llm("https://example.org/v1", "m", transport=endpoint(responses, sent)).complete([]).text == "{}"
+    assert waits == [15.0]
+
+
 def setup(
     tmp_path,
     monkeypatch,
