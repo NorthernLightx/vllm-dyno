@@ -262,7 +262,8 @@ def _expected(p: dict) -> str:
 
 def _plan_lines(picks: Sequence[dict]) -> list[str]:
     models = ", ".join(f"`{m}`" for m in dict.fromkeys(p["model"] for p in picks))
-    expected = ", with the gains it expected before they ran" if any(_expected(p) for p in picks) else ""
+    expects = any(_expected(p) for p in picks)
+    expected = ", with the gains it expected before they ran" if expects else ""
     lines = [
         "",
         "## Planner",
@@ -277,13 +278,14 @@ def _plan_lines(picks: Sequence[dict]) -> list[str]:
         [
             str(i),
             f"`{p['config']}`" if p["config"] else "stop",
-            _expected(p),
+            *([_expected(p)] if expects else []),
             _cell(p["result"]),
             _cell(p["hypothesis"]),
         ]
         for i, p in enumerate(picks, 1)
     ]
-    lines += _table(["#", "config", "expected chat, batch", "measured", "hypothesis"], rows)
+    header = ["#", "config", *(["expected chat, batch"] if expects else []), "measured", "hypothesis"]
+    lines += _table(header, rows)
     counted = [p["tokens"] for p in picks if p.get("tokens")]
     if counted:
         prompt, completion = (sum(t[k] for t in counted) for k in TOKENS)

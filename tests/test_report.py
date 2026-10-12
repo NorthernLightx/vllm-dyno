@@ -235,6 +235,7 @@ def test_report_lists_the_planner_picks_with_expected_and_measured_gains(ctx, tm
     ]
     text = render(meta(ctx), RECORDS, tmp_path, picks=picks)
     assert "`org/model` picked the configs to load after the baseline, in this order, with the gains it" in text
+    assert "| # | config | expected chat, batch | measured | hypothesis |" in text
     assert (
         "| 1 | `weights=fp8` | 1.10x, 1.20x | chat 11.31 req/s (1.13x), batch 2500 tok/s (1.25x), KL 0.0120 "
         r"| fp8 \| more KV |"
@@ -253,5 +254,6 @@ def test_report_lists_the_picks_of_a_planner_that_neither_expects_gains_nor_call
     assert (
         "`all` picked the configs to load after the baseline, in this order. A combination it picked ran offline"
     ) in text
-    assert "| 1 | `weights=fp8` |  | chat 11.31 req/s (1.13x) | next |" in text
+    assert "| # | config | measured | hypothesis |" in text
+    assert "| 1 | `weights=fp8` | chat 11.31 req/s (1.13x) | next |" in text
     assert "The endpoint counted" not in text
