@@ -1,25 +1,29 @@
-"""An LLM that picks which config `dyno load` measures next, through any OpenAI-compatible endpoint.
+"""The loop that loads, one at a time, the configs a proposer picks for `dyno load`.
 
-Each step shows the model the machine, the offline trials, the load records so far, its earlier picks
-with what they measured, and the configs it may pick: every combination of values that each ran offline
-within the quality limit on its own. It answers with one config and the gains it expects, or with none
-to stop. A combination is checked offline for quality first, as the rules do, and only a config within
-the limit starts a server, so the budget counts servers.
+Each step offers the proposer the configs it may pick: every combination of values that each ran offline
+within the quality limit on its own, not loaded yet. It answers with one config and the gains it expects,
+or with none to stop. A combination is checked offline for quality first, as the rules do, and only a
+config within the limit starts a server, so the budget counts servers.
 
-A stop counts only once the effect under load of every setting the model may change is known: offline
-speed can misjudge a setting under load, and a model that judges by it stops before loading that setting.
+A stop counts only once the effect under load of every setting the proposer may change is known: offline
+speed can misjudge a setting under load, and a proposer that judges by it stops before loading that setting.
 An effect is known once two configs that served, or one and the baseline, differ in that setting alone;
 a config that changes several untried settings at once shows none of their effects.
 
-If the endpoint fails, or answers twice with something outside the list, the rules finish the session,
-reusing every config already loaded.
+LlmProposer asks a chat model through any OpenAI-compatible endpoint. It shows the model the machine,
+the offline trials, the load records so far and its earlier picks with what they measured.
+
+If a proposer fails, such as an endpoint that fails or answers twice with something outside the list,
+the rules finish the session, reusing every config already loaded.
 
 <run>/plan.jsonl     one line per pick: hypothesis, expected and measured gains, tokens
-<run>/plan/*.json    the messages sent, and the replies of each step with their token usage
+<run>/plan/*.json    what a proposer recorded at each step; for an LLM, the messages and the replies
+                     with their token usage
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import time
@@ -27,6 +31,7 @@ from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 
@@ -128,6 +133,32 @@ class Proposal:
     hypothesis: str
     expected_chat: float | None = None
     expected_batch: float | None = None
+    tokens: dict[str, int] | None = None  # the endpoint's token counts, for proposers that call one
+
+
+@dataclass(frozen=True)
+class Step:
+    """What a proposer is shown at one step of plan()."""
+
+    session: LoadSession
+    goal: Goal
+    target: str  # "chat" or "batch"
+    journal: list[dict]  # this session's earlier picks, as plan.jsonl holds them
+    options: list[Candidate]  # the configs it may pick, from remaining()
+    untried: list[str]  # settings whose effect under load is not known yet, from untried()
+    servers_left: int
+    max_servers: int
+    step_file: Path  # <run>/plan/<session>-NN.json; a proposer may record its exchange there
+
+
+class Proposer(Protocol):
+    """Picks the config plan() loads next, or stops."""
+
+    name: str  # in plan.jsonl and the log
+
+    def propose(self, step: Step) -> Proposal:
+        """One of step.options, or a stop; PlannerError hands the session to the rules."""
+        ...
 
 
 def _key(label: str) -> frozenset[str]:
@@ -292,7 +323,7 @@ def brief(
     return "\n".join(lines)
 
 
-def propose(
+def ask(
     llm: Llm, messages: list[dict], options: list[Candidate], untried: Sequence[str], transcript: list[Reply]
 ) -> Proposal:
     """Ask for a pick, and once more if the reply names nothing allowed or stops too early. Replies go to transcript."""
@@ -310,6 +341,41 @@ def propose(
             {"role": "user", "content": f"{problem}. Answer again with one JSON object, as the system message says."},
         ]
     raise PlannerError(f"{llm.model} answered twice with no allowed config or stop: {problem}")
+
+
+class LlmProposer:
+    """A chat model that reads the brief of each step and answers with a pick; the exchange goes to the step file."""
+
+    def __init__(self, llm: Llm) -> None:
+        self.llm = llm
+        self.name: str = llm.model
+
+    def messages(self, step: Step) -> list[dict]:
+        """The messages the model is sent at step."""
+        text = brief(
+            step.session,
+            step.goal,
+            step.target,
+            step.journal,
+            step.options,
+            step.untried,
+            step.servers_left,
+            step.max_servers,
+        )
+        return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}]
+
+    def propose(self, step: Step) -> Proposal:
+        """The model's pick, with the tokens of every reply it took."""
+        messages = self.messages(step)
+        replies: list[Reply] = []
+        try:
+            p = ask(self.llm, messages, step.options, step.untried, replies)
+        except PlannerError as e:
+            step.step_file.write_text(_step(messages, replies, error=str(e)))
+            raise
+        step.step_file.write_text(_step(messages, replies))
+        tokens = {k: sum(int(r.usage.get(k) or 0) for r in replies) for k in TOKENS}
+        return dataclasses.replace(p, tokens=tokens)
 
 
 def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Candidate]:
@@ -356,9 +422,18 @@ def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Go
     ), started
 
 
+def _checked(proposer: Proposer, step: Step) -> Proposal:
+    p = proposer.propose(step)
+    if p.config is None and step.untried:
+        raise PlannerError(f"{proposer.name} stopped before the effect of {', '.join(step.untried)} is known")
+    if p.config is not None and p.config not in step.options:
+        raise PlannerError(f"{proposer.name} picked {p.config.label()!r}, which is not in the allowed list")
+    return p
+
+
 def plan(
     session: LoadSession,
-    llm: Llm,
+    proposer: Proposer,
     goal: Goal,
     target: str,
     *,
@@ -366,7 +441,11 @@ def plan(
     max_combos: int,
     trial_timeout_s: float,
 ) -> None:
-    """The baseline, then the configs the model picks, until it stops or max_servers servers have run."""
+    """The baseline, then the configs the proposer picks, until it stops or max_servers servers have run.
+
+    A stop before every setting's effect is known, or a pick outside the allowed list, fails the proposer
+    as a PlannerError does: the rules finish the session.
+    """
     session.baseline()
     searcher = Searcher(session.run, session.ctx, goal, session.env, trial_timeout_s)
     steps_dir = session.run.path / "plan"
@@ -378,34 +457,24 @@ def plan(
         if not options:
             log.info("plan     every allowed config is loaded")
             return
-        left = untried(session, options)
-        messages = [
-            {"role": "system", "content": SYSTEM},
-            {
-                "role": "user",
-                "content": brief(session, goal, target, journal, options, left, max_servers - servers, max_servers),
-            },
-        ]
-        replies: list[Reply] = []
         step_file = steps_dir / f"{session.id}-{len(journal) + 1:02d}.json"
+        left = untried(session, options)
+        step = Step(session, goal, target, list(journal), options, left, max_servers - servers, max_servers, step_file)
         try:
-            p = propose(llm, messages, options, left, replies)
+            p = _checked(proposer, step)
         except PlannerError as e:
-            step_file.write_text(_step(messages, replies, error=str(e)))
             log.warning("plan     %s; the rules finish the session", e)
             session.search(goal, max_combos, trial_timeout_s)
             return
-        step_file.write_text(_step(messages, replies))
-        tokens = {k: sum(int(r.usage.get(k) or 0) for r in replies) for k in TOKENS}
         if p.config is None:
-            log.info("plan     %s stops: %s", llm.model, p.hypothesis)
+            log.info("plan     %s stops: %s", proposer.name, p.hypothesis)
             entry = {"config": None, "hypothesis": p.hypothesis, "expected_chat": None, "expected_batch": None}
-            _append(session, llm, entry | {"result": "stop", "server": False, "tokens": tokens})
+            _append(session, proposer, entry | {"result": "stop", "server": False, "tokens": p.tokens})
             return
         label = p.config.label()
         log.info(
             "plan     %s picks %s, expecting chat %s, batch %s: %s",
-            llm.model,
+            proposer.name,
             label,
             _x(p.expected_chat),
             _x(p.expected_batch),
@@ -424,10 +493,10 @@ def plan(
             "expected_batch": p.expected_batch,
             "result": result,
             "server": started,
-            "tokens": tokens,
+            "tokens": p.tokens,
         }
         journal.append(entry)
-        _append(session, llm, entry)
+        _append(session, proposer, entry)
     log.info("plan     %d of %d servers started", servers, max_servers)
 
 
@@ -436,9 +505,9 @@ def _step(messages: list[dict], replies: list[Reply], **extra: str) -> str:
     return json.dumps({"messages": messages, "replies": texts, "usage": usage, **extra}, indent=2)
 
 
-def _append(session: LoadSession, llm: Llm, entry: dict) -> None:
+def _append(session: LoadSession, proposer: Proposer, entry: dict) -> None:
     with (session.run.path / "plan.jsonl").open("a") as f:
-        f.write(json.dumps({"session": session.id, "model": llm.model, **entry}) + "\n")
+        f.write(json.dumps({"session": session.id, "model": proposer.name, **entry}) + "\n")
 
 
 def plan_records(run_dir: Path) -> list[dict]:

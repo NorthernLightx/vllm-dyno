@@ -290,12 +290,11 @@ def cmd_load(args: argparse.Namespace) -> None:
             if r["label"] != "baseline":
                 session.measure(r)
     elif args.planner == "llm":
-        from .planner import Llm, plan
+        from .planner import Llm, LlmProposer, plan
 
-        llm = Llm(args.planner_url, args.planner_model, key)
         plan(
             session,
-            llm,
+            LlmProposer(Llm(args.planner_url, args.planner_model, key)),
             Goal(**run.meta["goal"]),
             args.goal,
             max_servers=args.max_servers,

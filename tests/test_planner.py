@@ -6,7 +6,7 @@ import pytest
 
 from vllm_dyno import load, planner
 from vllm_dyno.load import LoadSession, Slo
-from vllm_dyno.planner import Llm, PlannerError, allowed, parse, plan
+from vllm_dyno.planner import Llm, LlmProposer, PlannerError, Proposal, Step, allowed, parse, plan
 from vllm_dyno.runner import Run
 from vllm_dyno.search import Goal
 from vllm_dyno.space import KNOBS, Candidate
@@ -158,7 +158,7 @@ def setup(
     monkeypatch.setattr(planner, "Searcher", FakeSearcher)
     sent: list[httpx.Request] = []
     llm = Llm("https://example.org/v1", "org/model", transport=endpoint([answer(r) for r in replies], sent))
-    return LoadSession(run, ctx, [[1]], Slo(), 30, {}, 600, 6000, id="s"), llm, measured, sent
+    return LoadSession(run, ctx, [[1]], Slo(), 30, {}, 600, 6000, id="s"), LlmProposer(llm), measured, sent
 
 
 def pick(label: str | None, chat: float = 1.2) -> str:
@@ -176,10 +176,10 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
         pick("kv_cache_dtype=int8_per_token_head"),
         pick(None),
     ]
-    s, llm, measured, sent = setup(
+    s, proposer, measured, sent = setup(
         tmp_path, monkeypatch, ctx, replies, kl={"weights=fp8 kv_cache_dtype=int8_per_token_head": 0.06}
     )
-    plan(s, llm, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
+    plan(s, proposer, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
     assert measured == [
         "baseline",
         "attention_backend=TRITON_ATTN",
@@ -194,6 +194,7 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
         ("kv_cache_dtype=int8_per_token_head", True),
         (None, False),
     ]
+    assert {j["model"] for j in journal} == {"org/model"}
     assert journal[0]["result"] == "chat 12.00 req/s (1.20x), batch 1000 tok/s (1.00x), KL 0.0006"
     assert journal[1]["result"] == "KL 0.0600 offline, over the limit; no server started"
     assert journal[3]["tokens"] == {"prompt_tokens": 200, "completion_tokens": 20}  # the refused stop counts
@@ -222,8 +223,8 @@ def test_a_setting_is_known_once_two_configs_that_served_differ_in_it_alone(tmp_
         pick("weights=fp8"),
         pick(None),
     ]
-    s, llm, measured, sent = setup(tmp_path, monkeypatch, ctx, replies)
-    plan(s, llm, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
+    s, proposer, measured, sent = setup(tmp_path, monkeypatch, ctx, replies)
+    plan(s, proposer, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
     assert measured == [
         "baseline",
         "weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN",
@@ -239,30 +240,76 @@ def test_a_setting_is_known_once_two_configs_that_served_differ_in_it_alone(tmp_
 
 def test_the_planner_stops_at_its_server_budget(tmp_path, monkeypatch, ctx):
     replies = [pick("attention_backend=TRITON_ATTN"), pick("weights=fp8")]
-    s, llm, measured, _ = setup(tmp_path, monkeypatch, ctx, replies)
-    plan(s, llm, Goal(), "chat", max_servers=1, max_combos=8, trial_timeout_s=900)
+    s, proposer, measured, _ = setup(tmp_path, monkeypatch, ctx, replies)
+    plan(s, proposer, Goal(), "chat", max_servers=1, max_combos=8, trial_timeout_s=900)
     assert measured == ["baseline", "attention_backend=TRITON_ATTN"]
 
 
 def test_a_server_started_again_after_it_degraded_counts_against_the_budget(tmp_path, monkeypatch, ctx):
     replies = [pick("attention_backend=TRITON_ATTN"), pick("weights=fp8")]
-    s, llm, measured, _ = setup(tmp_path, monkeypatch, ctx, replies, slow=frozenset({"attention_backend=TRITON_ATTN"}))
-    plan(s, llm, Goal(), "chat", max_servers=2, max_combos=8, trial_timeout_s=900)
+    s, proposer, measured, _ = setup(
+        tmp_path, monkeypatch, ctx, replies, slow=frozenset({"attention_backend=TRITON_ATTN"})
+    )
+    plan(s, proposer, Goal(), "chat", max_servers=2, max_combos=8, trial_timeout_s=900)
     assert measured == ["baseline", "attention_backend=TRITON_ATTN", "attention_backend=TRITON_ATTN"]
 
 
 def test_the_rules_finish_the_session_when_the_model_names_no_allowed_config_twice(tmp_path, monkeypatch, ctx):
     replies = [pick("weights=org/base-AWQ"), "fp8, I think"]
-    s, llm, _, sent = setup(tmp_path, monkeypatch, ctx, replies)
+    s, proposer, _, sent = setup(tmp_path, monkeypatch, ctx, replies)
     searched = []
     monkeypatch.setattr(LoadSession, "search", lambda self, goal, max_combos, timeout: searched.append(max_combos))
-    plan(s, llm, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
+    plan(s, proposer, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
     assert searched == [8]
     retry = json.loads(sent[1].content)["messages"]
     assert retry[-1]["content"].startswith("'weights=org/base-AWQ' is not in the allowed list.")
     assert [m["role"] for m in retry] == ["system", "user", "assistant", "user"]
     step = json.loads(next((tmp_path / "plan").iterdir()).read_text())
     assert "answered twice with no allowed config or stop" in step["error"]
+
+
+class Scripted:
+    """A proposer that answers with the given proposals in turn, keeping each step it was shown."""
+
+    name = "scripted"
+
+    def __init__(self, *proposals: Proposal):
+        self.proposals = list(proposals)
+        self.steps: list[Step] = []
+
+    def propose(self, step: Step) -> Proposal:
+        self.steps.append(step)
+        return self.proposals.pop(0)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        Proposal(None, "done"),  # the weights and the KV cache dtype are not known yet
+        Proposal(cand("weights=org/base-AWQ"), "over the KL limit offline"),
+    ],
+)
+def test_the_rules_finish_the_session_when_any_proposer_stops_too_early_or_picks_outside_the_list(
+    tmp_path, monkeypatch, ctx, bad
+):
+    s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [])
+    searched = []
+    monkeypatch.setattr(LoadSession, "search", lambda self, goal, max_combos, timeout: searched.append(max_combos))
+    proposer = Scripted(Proposal(cand("attention_backend=TRITON_ATTN"), "h", 1.2), bad)
+    plan(s, proposer, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
+    assert (measured, searched) == (["baseline", "attention_backend=TRITON_ATTN"], [8])
+    first, second = proposer.steps
+    assert first.untried == ["weights", "kv_cache_dtype", "attention_backend"]
+    assert second.untried == ["weights", "kv_cache_dtype"]
+    assert (first.servers_left, second.servers_left, second.max_servers) == (10, 9, 10)
+    assert [j["config"] for j in second.journal] == ["attention_backend=TRITON_ATTN"]
+    assert (first.step_file, second.step_file) == (tmp_path / "plan" / "s-01.json", tmp_path / "plan" / "s-02.json")
+    assert "attention_backend=TRITON_ATTN" in [c.label() for c in first.options]
+    assert "attention_backend=TRITON_ATTN" not in [c.label() for c in second.options]
+    journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
+    assert [(j["model"], j["config"], j["expected_chat"], j["tokens"]) for j in journal] == [
+        ("scripted", "attention_backend=TRITON_ATTN", 1.2, None)
+    ]
 
 
 def test_a_stop_counts_only_once_no_setting_is_left_untried():
