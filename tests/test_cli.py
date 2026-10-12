@@ -83,10 +83,10 @@ def test_load_takes_the_planner_key_out_of_the_environment_before_starting_anyth
 
 
 def test_every_planner_but_the_rules_gets_a_server_budget_and_all_gets_none_unless_given(tmp_path):
-    for planner in ("all",):
+    for planner in ("fit", "all"):
         with pytest.raises(SystemExit, match="is not a run directory"):
             main(["load", str(tmp_path / "missing"), "--planner", planner])
-    assert cli._max_servers("llm", None) == 10
+    assert cli._max_servers("llm", None) == cli._max_servers("fit", None) == 10
     assert cli._max_servers("all", None) == sys.maxsize
     assert (cli._max_servers("all", 3), cli._max_servers("llm", 3)) == (3, 3)
 

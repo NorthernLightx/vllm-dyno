@@ -239,10 +239,13 @@ def _max_servers(planner: str, value: int | None) -> int:
 
 
 def _proposer(args: argparse.Namespace, key: str | None):
+    from .fit import FitProposer
     from .planner import AllProposer, Llm, LlmProposer
 
     if args.planner == "llm":
         return LlmProposer(Llm(args.planner_url, args.planner_model, key))
+    if args.planner == "fit":
+        return FitProposer()
     return AllProposer()
 
 
@@ -428,10 +431,11 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
     load.add_argument(
         "--planner",
-        choices=["rules", "llm", "all"],
+        choices=["rules", "llm", "fit", "all"],
         default="rules",
         help=(
             "rules: every setting, then combinations of those that gained; llm: a model picks each config; "
+            "fit: the config likeliest to win under a fit of each setting's gain; "
             "all: every allowed config, to measure the whole space"
         ),
     )
@@ -449,7 +453,7 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument(
         "--max-servers",
         type=int,
-        help=f"servers the llm or all planner may start after the baseline (default {MAX_SERVERS}; no cap for all)",
+        help=f"servers the llm, fit or all planner may start after the baseline (default {MAX_SERVERS}; no cap for all)",
     )
     load.add_argument(
         "--trial-timeout", type=float, default=900, help="seconds before a combination's quality trial is killed"

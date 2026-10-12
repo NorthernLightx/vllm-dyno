@@ -1,13 +1,16 @@
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 
 import httpx
 import pytest
 
 from vllm_dyno import load, planner
-from vllm_dyno.load import LoadSession, Slo
+from vllm_dyno.fit import FitProposer
+from vllm_dyno.load import LoadSession, Slo, load_records
 from vllm_dyno.planner import AllProposer, Llm, LlmProposer, PlannerError, Proposal, Step, allowed, parse, plan
+from vllm_dyno.report import load_recommendation
 from vllm_dyno.runner import Run
 from vllm_dyno.search import Goal
 from vllm_dyno.space import KNOBS, Candidate
@@ -128,6 +131,10 @@ def test_a_body_that_is_an_array_or_holds_a_string_error_fails_as_its_status_say
     assert waits == [15.0]
 
 
+def triton_faster(label: str) -> tuple[float, float]:
+    return (12.0 if "TRITON_ATTN" in label else 10.0), 1000.0
+
+
 def setup(
     tmp_path,
     monkeypatch,
@@ -135,10 +142,12 @@ def setup(
     replies: list[str],
     kl: dict[str, float] | None = None,
     slow: frozenset[str] = frozenset(),
+    serve: Callable[[str], tuple[float, float]] = triton_faster,
 ):
-    """A load session over SCREEN whose servers serve 10 req/s and 1000 tok/s, more with TRITON_ATTN.
+    """A load session over SCREEN whose servers serve the req/s and tok/s serve gives for their config.
 
-    The first server of each config in slow is degraded.
+    By default 10 req/s and 1000 tok/s, more with TRITON_ATTN. A combination's quality trial measures KL 0.01
+    unless kl says otherwise. The first server of each config in slow is degraded.
     """
     run = Run(tmp_path)
     for r in SCREEN:
@@ -147,17 +156,17 @@ def setup(
 
     def fake_measure(r, *args, **kwargs):
         measured.append(r["label"])
-        triton = "TRITON_ATTN" in r["label"]
+        chat, batch = serve(r["label"])
         return {
             "label": r["label"],
             **{k: r[k] for k in KNOBS},
             "status": "degraded" if r["label"] in slow and measured.count(r["label"]) == 1 else "ok",
             "error": None,
-            "capacity_rps": 12.0 if triton else 10.0,
+            "capacity_rps": chat,
             "chat": {"tpot_p90_ms": 40.0},
-            "batch": {"tput_tok_s": 1000.0, "kv_peak": 0.5, "preemptions": 0},
+            "batch": {"tput_tok_s": batch, "kv_peak": 0.5, "preemptions": 0},
             "kv_tokens": 100_000,
-            "backend": "TRITON_ATTN" if triton else "FLASH_ATTN",
+            "backend": "TRITON_ATTN" if "TRITON_ATTN" in r["label"] else "FLASH_ATTN",
             "wall_s": 400.0,
         }
 
@@ -166,7 +175,14 @@ def setup(
             pass
 
         def stage(self, stage, cands, tier):
-            return [trial(stage, c.label(), (kl or {}).get(c.label(), 0.01)) for c in cands]
+            out = []
+            for c in cands:
+                r = run.find(f"{stage}|{c.label()}")
+                if r is None:
+                    r = trial(stage, c.label(), (kl or {}).get(c.label(), 0.01))
+                    run.append(r)  # as runner.run_trial does
+                out.append(r)
+            return out
 
     monkeypatch.setattr(load, "measure_config", fake_measure)
     monkeypatch.setattr(load, "wait_for_gpu", lambda free_mib: None)
@@ -350,6 +366,35 @@ def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypa
     s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [])
     plan(s, AllProposer(), Goal(), "chat", max_servers=2, max_combos=8, trial_timeout_s=900)
     assert measured == ["baseline", "attention_backend=TRITON_ATTN", "kv_cache_dtype=int8_per_token_head"]
+
+
+PLANTED = {  # chat and batch gains of each value; they multiply, and weights=fp8 with TRITON_ATTN serves best
+    "weights=fp8": (1.15, 1.25),
+    "kv_cache_dtype=int8_per_token_head": (0.9, 1.1),
+    "attention_backend=TRITON_ATTN": (1.3, 1.0),
+}
+
+
+def planted(label: str) -> tuple[float, float]:
+    chat, batch = 10.0, 1000.0
+    for value in label.split():
+        c, b = PLANTED.get(value, (1.0, 1.0))
+        chat, batch = chat * c, batch * b
+    return chat, batch
+
+
+def test_the_fit_planner_finds_the_best_config_of_a_space_whose_gains_multiply(tmp_path, monkeypatch, ctx):
+    s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [], serve=planted)
+    monkeypatch.setattr(LoadSession, "search", lambda *args: pytest.fail("the rules finished the session"))
+    plan(s, FitProposer(), Goal(), "chat", max_servers=5, max_combos=8, trial_timeout_s=900)
+    journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
+    assert "weights=fp8 attention_backend=TRITON_ATTN" in measured
+    assert journal[-1]["config"] is None and len(measured) - 1 < 5  # it stopped on its own
+    picked = load_recommendation(load_records(tmp_path), s.run.records, Goal(), "chat")
+    assert picked is not None and picked[0]["label"] == "weights=fp8 attention_backend=TRITON_ATTN"
+    assert {j["model"] for j in journal} == {"fit"}
+    assert all(j["expected_chat"] and j["expected_batch"] for j in journal[:-1])
+    assert len(list((tmp_path / "plan").iterdir())) == len(journal)
 
 
 def test_a_stop_counts_only_once_no_setting_is_left_untried():
