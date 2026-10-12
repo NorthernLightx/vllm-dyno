@@ -9,7 +9,8 @@ At each step the planner draws gains of the configs it may pick from the fit, ke
 the configs that served, and applies the report's recommendation rule to each draw. A config's win
 probability is the share of draws that recommend it. While the effect under load of a setting is not
 known, the planner picks among the configs that differ from one that served in such a setting alone, so
-that its stop counts; after that among all, until none wins STOP_P of the draws.
+that its stop counts; after that among all, until none wins STOP_P of the draws. It leaves out a config
+that names the attention backend the server of its auto twin picked anyway, which starts no server.
 
 <run>/plan/*.json    the fitted weights, and each config's predicted gains, KL and win probability, which is
                      null for a config the step did not let it pick
@@ -20,7 +21,7 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from statistics import NormalDist
 
 from .load import MIN_RATE, gains, load_records, session_baseline
@@ -226,9 +227,12 @@ class FitProposer:
         """While a setting is untried, the likeliest config that settles one; then the likeliest, or a stop."""
         records, load = step.session.run.records, load_records(step.session.run.path)
         served = {candidate_of(r) for r in load if r["status"] == "ok"}
-        settles = {c: _settles(c, served, step.untried) for c in step.options}
+        # plan() starts no server for a config that names the backend its auto twin's server picked anyway;
+        # once only such configs are left, picking them runs the list out and ends the session
+        options = [c for c in step.options if not step.session.same_engine(asdict(c))] or step.options
+        settles = {c: _settles(c, served, step.untried) for c in options}
         # none settles a setting alone once each config that would has failed under load
-        pool = [c for c in step.options if settles[c]] or step.options
+        pool = [c for c in options if settles[c]] or options
         model = fit(records, load, step.options)
         kl = {c: predicted_kl(records, c) for c in step.options}
         scores = {label: s for label, (_, s) in load_scores(load, records, step.goal).items()}

@@ -102,6 +102,25 @@ def test_while_a_setting_is_untried_it_picks_a_config_that_settles_one_alone(tmp
     assert wins[f"{FP8} {INT8} {TRITON}"] is None and wins[f"{FP8} {TRITON}"] > 0.5
 
 
+def test_it_never_picks_a_config_that_names_the_backend_the_server_of_its_auto_twin_picked(tmp_path, ctx):
+    trials = [
+        screen("baseline", 1000, 0.0),
+        screen(FP8, 1000, 0.007),
+        screen(INT8, 1100, 0.013),
+        screen(TRITON, 1200, 0.0006),
+    ]
+    twin, picks = f"{INT8} {TRITON}", {}
+    for backend in ("FLASH_ATTN", "TRITON_ATTN"):
+        loads = [served("baseline", 10, 1000), served(INT8, 13, 1100) | {"backend": backend}]
+        s = step(tmp_path / backend, ctx, trials, loads)
+        picks[backend] = FitProposer().propose(s).config
+    assert picks["FLASH_ATTN"] == cand(twin)  # settles the backend against int8 KV, the likeliest to win
+    # plan() starts no server for it once the server of int8 KV picked TRITON_ATTN itself
+    assert picks["TRITON_ATTN"] != cand(twin)
+    wins = {c["config"]: c["win"] for c in json.loads(s.step_file.read_text())["configs"]}
+    assert wins[twin] is None
+
+
 SETTLED = [
     screen("baseline", 1000, 0.0),
     screen(FP8, 1000, 0.007),
