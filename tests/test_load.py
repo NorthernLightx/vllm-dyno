@@ -30,11 +30,21 @@ from vllm_dyno.search import Goal
 from vllm_dyno.space import KNOBS, Candidate
 
 
-def completion(tokens: int) -> bytes:
+def completion(tokens: int, text: str = "x") -> bytes:
     """A streamed completion as vLLM sends it: one chunk per token, then usage, then [DONE]."""
-    chunks: list[dict] = [{"choices": [{"index": 0, "text": "x"}]} for _ in range(tokens)]
+    chunks: list[dict] = [{"choices": [{"index": 0, "text": text}]} for _ in range(tokens)]
     chunks.append({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": tokens}})
-    return b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks) + b"data: [DONE]\n\n"
+    # like vLLM's pydantic, json escapes only control characters below U+0020 when ensure_ascii is off
+    return b"".join(f"data: {json.dumps(c, ensure_ascii=False)}\n\n".encode() for c in chunks) + b"data: [DONE]\n\n"
+
+
+class Pieces(httpx.AsyncByteStream):
+    def __init__(self, data: bytes, size: int):
+        self.data, self.size = data, size
+
+    async def __aiter__(self):
+        for i in range(0, len(self.data), self.size):
+            yield self.data[i : i + self.size]
 
 
 def run_send(handler, prompts, slo=None, watch_server=False):
@@ -70,6 +80,16 @@ def test_the_health_check_decodes_greedily_like_the_offline_engine():
     transport = httpx.MockTransport(handler)
     asyncio.run(send("http://server", "org/base", [[1]], [0.0], 8, transport=transport, params=GREEDY))
     assert {k: bodies[0][k] for k in GREEDY} == GREEDY == {"temperature": 0.0, "repetition_penalty": 1.0}
+
+
+@pytest.mark.parametrize("piece", [7, None])
+def test_a_token_whose_text_holds_a_unicode_line_separator_stays_in_its_event(piece):
+    body = completion(8, text="a\x85b\u2028c\u2029d")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Pieces(body, piece or len(body)))
+
+    assert [(t.tokens, t.error) for t in run_send(handler, [[1]]).timings] == [(8, None)]
 
 
 def test_http_errors_and_short_streams_are_errors():

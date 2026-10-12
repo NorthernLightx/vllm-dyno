@@ -55,7 +55,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -141,6 +141,21 @@ def poisson_starts(rate: float, n: int, seed: int = 0) -> list[float]:
     return starts
 
 
+async def event_lines(resp: httpx.Response) -> AsyncIterator[str]:
+    """The lines of a server-sent event stream.
+
+    httpx's aiter_lines() also ends a line wherever str.splitlines() would, at U+0085, U+2028 and
+    U+2029 among others, and JSON leaves those unescaped inside strings such as a token's text.
+    """
+    rest = ""
+    async for text in resp.aiter_text():
+        *lines, rest = (rest + text).split("\n")
+        for line in lines:
+            yield line.removesuffix("\r")
+    if rest:
+        yield rest
+
+
 async def stream_one(
     client: httpx.AsyncClient, model: str, prompt: list[int], max_tokens: int, params: dict | None = None
 ) -> Timing:
@@ -162,7 +177,7 @@ async def stream_one(
             if resp.status_code != 200:
                 text = (await resp.aread()).decode(errors="replace")
                 return Timing(error=f"HTTP {resp.status_code}: {text[:200]}")
-            async for line in resp.aiter_lines():
+            async for line in event_lines(resp):
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
                 chunk = json.loads(line[6:])
