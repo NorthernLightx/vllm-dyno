@@ -416,7 +416,7 @@ class OptunaProposer:
         from optuna.distributions import BaseDistribution, CategoricalDistribution
         from optuna.trial import create_trial
 
-        known = self._known(step)
+        known = _known(step)
         cands = [*step.options, *(c for c in known if c not in step.options)]
         dists: dict[str, BaseDistribution] = {
             k: CategoricalDistribution(sorted({DEFAULTS[k], *(getattr(c, k) for c in cands)})) for k in KNOBS
@@ -445,28 +445,29 @@ class OptunaProposer:
             rng.choice(step.options), f"TPE asked for measured configs {OPTUNA_ASKS} times; drawn at random"
         )
 
-    def _known(self, step: Step) -> dict[Candidate, tuple[float, bool]]:
-        """Score and feasibility of every config measured or tried so far."""
-        known: dict[Candidate, tuple[float, bool]] = {}
-        load_ = load_records(step.session.run.path)
-        for r in load_:
-            chat, batch = gains(r, session_baseline(load_, r))
-            if chat is not None and batch is not None:
-                known[candidate_of(r)] = (_score(chat, batch, step.target), True)
-            else:
-                known.setdefault(candidate_of(r), (INFEASIBLE, False))
-        trials = [r for r in step.session.run.records if r["stage"] in ("screen", "combine")]
-        for r in trials:  # a single that failed offline added no value to the search space
-            if r["stage"] == "combine" and (r["status"] != "ok" or r["kl"] > step.goal.max_kl):
-                known.setdefault(candidate_of(r), (INFEASIBLE, False))
-        for j in step.journal:
-            cand = _candidate(j["config"])
-            if cand in known:
-                continue
-            r = next((r for r in trials if r["label"] == j["config"] and r["status"] == "ok"), None)
-            twin = step.session.same_engine(r) if r else None
-            known[cand] = known.get(_candidate(twin), (INFEASIBLE, False)) if twin else (INFEASIBLE, False)
-        return known
+
+def _known(step: Step) -> dict[Candidate, tuple[float, bool]]:
+    """Score and feasibility of every config measured or tried so far."""
+    known: dict[Candidate, tuple[float, bool]] = {}
+    load_ = load_records(step.session.run.path)
+    for r in load_:
+        chat, batch = gains(r, session_baseline(load_, r))
+        if chat is not None and batch is not None:
+            known[candidate_of(r)] = (_score(chat, batch, step.target), True)
+        else:
+            known.setdefault(candidate_of(r), (INFEASIBLE, False))
+    trials = [r for r in step.session.run.records if r["stage"] in ("screen", "combine")]
+    for r in trials:  # a single that failed offline added no value to the search space
+        if r["stage"] == "combine" and (r["status"] != "ok" or r["kl"] > step.goal.max_kl):
+            known.setdefault(candidate_of(r), (INFEASIBLE, False))
+    for j in step.journal:
+        cand = _candidate(j["config"])
+        if cand in known:
+            continue
+        r = next((r for r in trials if r["label"] == j["config"] and r["status"] == "ok"), None)
+        twin = step.session.same_engine(r) if r else None
+        known[cand] = known.get(_candidate(twin), (INFEASIBLE, False)) if twin else (INFEASIBLE, False)
+    return known
 
 
 def _offline_estimate(records: list[dict]) -> Callable[[Candidate], float]:
