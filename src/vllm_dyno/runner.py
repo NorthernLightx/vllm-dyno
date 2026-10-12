@@ -31,7 +31,7 @@ OOM_PATTERNS = (
     "out of memory",
     "outofmemoryerror",
     "no available memory for the cache blocks",
-    "available kv cache memory",
+    "larger than the available kv cache memory",
     "less than desired gpu memory utilization",
 )
 UNSUPPORTED_PATTERNS = ("not supported", "notimplementederror", "unsupported", "does not support")
@@ -44,7 +44,8 @@ def classify(log_text: str) -> tuple[str, str]:
     """Status and a one-line error for a trial process that exited without metrics.
 
     Only exception lines decide "unsupported": a successful engine logs plenty of
-    "not supported" warnings too.
+    "not supported" warnings too. OOM patterns are searched in the whole log as well,
+    so none may match a line every start logs, such as "Available KV cache memory: 1.34 GiB".
     """
     errors = [f"{name}: {msg.strip()}" for name, msg in ERROR_LINE.findall(log_text)]
     causes = [e for e in errors if not any(w in e.lower() for w in WRAPPERS)] or errors
