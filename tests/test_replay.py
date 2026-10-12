@@ -90,11 +90,13 @@ def served(label: str, capacity: float, batch: float, backend: str) -> dict:
     }
 
 
-def write_run(path, ctx, offline=OFFLINE, load_sha=load.LOAD_SHA) -> None:
+def write_run(path, ctx, offline=OFFLINE, harness_sha="abc", **load_json) -> None:
+    """A finished `dyno run` with its load.json; a load.json key given as None is left out."""
     path.mkdir()
-    meta = {"context": ctx.to_json(), "goal": asdict(Goal()), "harness_sha": "abc", "free_mib_at_start": 6000}
+    meta = {"context": ctx.to_json(), "goal": asdict(Goal()), "harness_sha": harness_sha, "free_mib_at_start": 6000}
     (path / "run.json").write_text(json.dumps(meta))
-    settings = {"slo": asdict(Slo()), "probe_s": 30, "load_sha": load_sha, "env": {}, "free_mib_at_start": 6000}
+    settings = {"slo": asdict(Slo()), "probe_s": 30, "load_sha": load.LOAD_SHA, "env": {}, "free_mib_at_start": 6000}
+    settings = {k: v for k, v in (settings | load_json).items() if v is not None}
     (path / "load.json").write_text(json.dumps(settings))
     run = Run(path)
     for r in offline:
@@ -311,6 +313,19 @@ def test_runs_measured_with_other_load_code_are_not_pooled(tmp_path, ctx):
     expected = f"{ours} and {theirs} were measured differently (load code {load.LOAD_SHA} against 000000000000)"
     with pytest.raises(SystemExit, match=re.escape(expected)):
         replay.recorded([ours, theirs])
+
+
+def test_runs_whose_load_json_has_no_environment_pool_only_with_each_other(tmp_path, monkeypatch, ctx):
+    old, older, new = tmp_path / "old", tmp_path / "older", tmp_path / "new"
+    for path, env in ((old, None), (older, None), (new, {})):
+        write_run(path, ctx, env=env)
+        record_session(monkeypatch, path, ctx, "s1", lambda s: s.search(Goal(), 8, 900))
+    assert "env" not in json.loads((old / "load.json").read_text())
+    result = replay.replay([old, older], "rules", repeats=1, max_servers=10, max_combos=8, seed=0, target="chat")
+    assert (result["summary"]["completed"], result["truth"]["pick"]) == (1, FP8_INT8)
+    expected = f"{old} and {new} were measured differently (environment None against {{}})"
+    with pytest.raises(SystemExit, match=re.escape(expected)):
+        replay.recorded([old, new])
 
 
 def test_optuna_loads_the_configs_best_offline_first_then_what_tpe_asks_for(tmp_path, monkeypatch, ctx):

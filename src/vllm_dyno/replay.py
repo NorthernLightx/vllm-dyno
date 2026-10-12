@@ -138,7 +138,7 @@ def _measured_by(meta: dict, settings: dict) -> dict:
         "load code": settings["load_sha"],
         "SLO": settings["slo"],
         "probe window": settings["probe_s"],
-        "environment": settings["env"],
+        "environment": settings.get("env"),  # None: load.json from before dyno load recorded it
     }
 
 
