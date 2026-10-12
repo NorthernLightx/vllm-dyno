@@ -368,11 +368,12 @@ def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypa
     assert measured == ["baseline", "attention_backend=TRITON_ATTN", "kv_cache_dtype=int8_per_token_head"]
 
 
-PLANTED = {  # chat and batch gains of each value; they multiply, and weights=fp8 with TRITON_ATTN serves best
+PLANTED = {  # chat and batch gains of each value; they multiply
     "weights=fp8": (1.15, 1.25),
-    "kv_cache_dtype=int8_per_token_head": (0.9, 1.1),
-    "attention_backend=TRITON_ATTN": (1.3, 1.0),
+    "kv_cache_dtype=int8_per_token_head": (0.7, 1.4),
+    "attention_backend=TRITON_ATTN": (1.3, 0.8),
 }
+BEST = {"chat": "weights=fp8 attention_backend=TRITON_ATTN", "batch": "weights=fp8 kv_cache_dtype=int8_per_token_head"}
 
 
 def planted(label: str) -> tuple[float, float]:
@@ -383,15 +384,27 @@ def planted(label: str) -> tuple[float, float]:
     return chat, batch
 
 
-def test_the_fit_planner_finds_the_best_config_of_a_space_whose_gains_multiply(tmp_path, monkeypatch, ctx):
+def test_the_planted_space_has_one_best_config_for_chat_and_another_for_batch(tmp_path, monkeypatch, ctx):
+    s, _, _, _ = setup(tmp_path, monkeypatch, ctx, [], serve=planted)
+    plan(s, AllProposer(), Goal(), "chat", max_servers=sys.maxsize, max_combos=8, trial_timeout_s=900)
+    for target, best in BEST.items():
+        picked = load_recommendation(load_records(tmp_path), s.run.records, Goal(), target)
+        assert picked is not None and picked[0]["label"] == best
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("target", ["chat", "batch"])
+def test_the_fit_planner_finds_the_best_config_of_a_space_whose_gains_multiply(
+    tmp_path, monkeypatch, ctx, target, seed
+):
     s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [], serve=planted)
     monkeypatch.setattr(LoadSession, "search", lambda *args: pytest.fail("the rules finished the session"))
-    plan(s, FitProposer(), Goal(), "chat", max_servers=5, max_combos=8, trial_timeout_s=900)
+    plan(s, FitProposer(seed), Goal(), target, max_servers=5, max_combos=8, trial_timeout_s=900)
     journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
-    assert "weights=fp8 attention_backend=TRITON_ATTN" in measured
+    assert BEST[target] in measured
     assert journal[-1]["config"] is None and len(measured) - 1 < 5  # it stopped on its own
-    picked = load_recommendation(load_records(tmp_path), s.run.records, Goal(), "chat")
-    assert picked is not None and picked[0]["label"] == "weights=fp8 attention_backend=TRITON_ATTN"
+    picked = load_recommendation(load_records(tmp_path), s.run.records, Goal(), target)
+    assert picked is not None and picked[0]["label"] == BEST[target]
     assert {j["model"] for j in journal} == {"fit"}
     assert all(j["expected_chat"] and j["expected_batch"] for j in journal[:-1])
     assert len(list((tmp_path / "plan").iterdir())) == len(journal)

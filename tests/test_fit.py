@@ -2,6 +2,7 @@ import json
 import math
 import random
 from dataclasses import asdict
+from statistics import NormalDist
 
 import pytest
 
@@ -26,6 +27,11 @@ def screen(label: str, tput: float, kl: float) -> dict:
         "tput_tok_s": tput,
         "kl": kl,
     }
+
+
+def offline(stage: str, label: str, kl: float) -> dict:
+    """A quality trial of a combination in the combine or the confirm stage."""
+    return screen(label, 1000, kl) | {"key": f"{stage}|{label}", "stage": stage}
 
 
 def served(label: str, chat: float | None, batch: float) -> dict:
@@ -64,6 +70,16 @@ def test_the_posterior_of_two_weights_matches_its_closed_form():
     assert cov == pytest.approx(-0.2, abs=0.02)
 
 
+def test_a_predicted_gain_is_the_exp_of_the_posterior_mean_with_a_central_90_percent_interval():
+    chat = posterior([[1.0, 0.0], [1.0, 1.0]], [1.0, 3.0], [1.0, 0.0], prior_sd=1.0, noise_sd=1.0)
+    batch = fit.Posterior([0.1, 0.2], [[0.01, 0.0], [0.0, 0.03]])
+    model = fit.Fit([("weights", "fp8"), ("attention_backend", "TRITON_ATTN")], chat, batch)
+    z = NormalDist().inv_cdf(0.95)
+    predicted = model.predicted_gains(cand(f"{FP8} {TRITON}"))
+    for name, m, sd in (("chat", 2.2, math.sqrt(0.6)), ("batch", 0.3, math.sqrt(0.04))):
+        assert predicted[name] == pytest.approx([math.exp(m), math.exp(m - z * sd), math.exp(m + z * sd)])
+
+
 def test_one_load_record_moves_a_weight_from_its_prior_by_the_ratio_of_their_precisions():
     post = posterior([[1.0]], [0.1], [0.3])  # precisions 1 / 0.25² = 16 and 1 / 0.04² = 625
     assert post.mean == pytest.approx([(16 * 0.3 + 625 * 0.1) / 641])
@@ -93,13 +109,27 @@ def test_while_a_setting_is_untried_it_picks_a_config_that_settles_one_alone(tmp
     assert p.config == cand(f"{FP8} {TRITON}")
     assert p.hypothesis.startswith(f"Settles weights against {TRITON} and wins ")
     model = fit.fit(s.session.run.records, loads, s.options)
-    assert p.expected_chat == pytest.approx(model.predicted_gains(cand(f"{FP8} {TRITON}"))["chat"][0])
+    predicted = model.predicted_gains(cand(f"{FP8} {TRITON}"))
+    assert (p.expected_chat, p.expected_batch) == pytest.approx((predicted["chat"][0], predicted["batch"][0]))
+    assert predicted["chat"][0] > 1.2 * predicted["batch"][0]  # TRITON_ATTN served chat faster, batch not
     # the config predicted to serve chat best changes both untried settings at once, which shows neither
     assert max(s.options, key=lambda c: model.predicted_gains(c)["chat"][0]) == cand(f"{FP8} {INT8} {TRITON}")
     recorded = json.loads(s.step_file.read_text())
     assert recorded["pick"] == f"{FP8} {TRITON}"
     wins = {c["config"]: c["win"] for c in recorded["configs"]}
     assert wins[f"{FP8} {INT8} {TRITON}"] is None and wins[f"{FP8} {TRITON}"] > 0.5
+
+
+def test_at_the_first_step_it_settles_one_setting_against_the_baseline(tmp_path, ctx):
+    loads = [served("baseline", 10, 1000)]
+    s = step(tmp_path, ctx, COVERAGE, loads)
+    p = FitProposer().propose(s)
+    assert p.config is not None and len(p.config.changes()) == 1
+    [setting] = p.config.changes()
+    assert p.hypothesis.startswith(f"Settles {setting} against the baseline and wins ")
+    model = fit.fit(s.session.run.records, loads, s.options)
+    # the config predicted to serve chat best changes two untried settings at once
+    assert len(max(s.options, key=lambda c: model.predicted_gains(c)["chat"][0]).changes()) > 1
 
 
 def test_it_never_picks_a_config_that_names_the_backend_the_server_of_its_auto_twin_picked(tmp_path, ctx):
@@ -150,6 +180,16 @@ def test_it_does_not_stop_while_a_setting_is_untried_however_unlikely_the_config
     assert wins[p.config.label()] < fit.STOP_P
 
 
+def test_of_configs_equally_likely_to_win_it_picks_the_first_allowed(tmp_path, ctx):
+    slow = [*SETTLED[:-1], screen(TRITON, 100, 0.0006)]  # offline, TRITON_ATTN runs at a tenth of the speed
+    s = step(tmp_path, ctx, slow, [served("baseline", 10, 1000), served(FP8, 50, 1500), served(INT8, 8, 1100)])
+    p = FitProposer().propose(s)
+    wins = {c["config"]: c["win"] for c in json.loads(s.step_file.read_text())["configs"]}
+    # the configs that settle the backend against one that served; none beats fp8's 5x in any draw
+    assert wins[TRITON] == wins[f"{INT8} {TRITON}"] == wins[f"{FP8} {TRITON}"] == 0.0
+    assert p.config == s.options[0] == cand(TRITON)
+
+
 def test_a_config_that_missed_the_slo_at_every_rate_drags_down_the_chat_of_its_combinations(tmp_path, ctx):
     loads = [served("baseline", 10, 1000), served(FP8, None, 1500)]
     s = step(tmp_path, ctx, SETTLED, loads)
@@ -160,20 +200,39 @@ def test_a_config_that_missed_the_slo_at_every_rate_drags_down_the_chat_of_its_c
     assert p.config is not None and p.config.weights == "base"
 
 
+NEAR_LIMIT = [  # fp8 and int8 KV are each within the KL limit of 0.05, and their KLs add up to more
+    screen("baseline", 1000, 0.0),
+    screen(FP8, 1000, 0.03),
+    screen(INT8, 1000, 0.03),
+    screen(TRITON, 1000, 0.0),
+]
+NEAR_LIMIT_LOADS = [
+    served("baseline", 10, 1000),
+    served(FP8, 12, 1200),
+    served(INT8, 12, 1200),
+    served(TRITON, 9, 1000),
+]
+
+
 def test_a_config_over_the_kl_limit_never_wins(tmp_path, ctx):
-    trials = [
-        screen("baseline", 1000, 0.0),
-        screen(FP8, 1000, 0.03),
-        screen(INT8, 1000, 0.03),
-        screen(TRITON, 1000, 0.0),
-    ]
-    loads = [served("baseline", 10, 1000), served(FP8, 12, 1200), served(INT8, 12, 1200), served(TRITON, 9, 1000)]
-    s = step(tmp_path, ctx, trials, loads)
+    s = step(tmp_path, ctx, NEAR_LIMIT, NEAR_LIMIT_LOADS)
     p = FitProposer().propose(s)
     recorded = {c["config"]: c for c in json.loads(s.step_file.read_text())["configs"]}
     both = recorded[f"{FP8} {INT8}"]
     assert both["chat"][0] > 1.3 and both["kl"] == pytest.approx(0.06) and both["win"] == 0.0
     assert p.config is None
+
+
+def test_the_kl_a_combination_measured_offline_counts_instead_of_the_sum_of_its_settings(tmp_path, ctx):
+    both = f"{FP8} {INT8}"
+    trials = [*NEAR_LIMIT, offline("combine", both, 0.02)]
+    s = step(tmp_path, ctx, trials, NEAR_LIMIT_LOADS)
+    p = FitProposer().propose(s)
+    recorded = {c["config"]: c for c in json.loads(s.step_file.read_text())["configs"]}
+    assert recorded[both]["kl"] == pytest.approx(0.02) and recorded[both]["win"] > 0.5
+    assert p.config == cand(both)
+    # a confirm trial measured KL on more tokens, as the recommendation weighs it once the config served
+    assert fit.predicted_kl([*trials, offline("confirm", both, 0.025)], cand(both)) == 0.025
 
 
 def test_the_same_run_state_gives_the_same_proposal_and_step_file(tmp_path, ctx):
