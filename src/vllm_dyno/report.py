@@ -70,6 +70,7 @@ def _cost(r: dict, gpu_price: float | None) -> str:
 
 
 def markdown_table(header: list[str], rows: list[list[str]]) -> list[str]:
+    """The lines of a markdown table with this header and these rows of cell text."""
     return [
         "| " + " | ".join(header) + " |",
         "|" + "---|" * len(header),
