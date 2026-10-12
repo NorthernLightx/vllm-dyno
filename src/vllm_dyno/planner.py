@@ -36,6 +36,7 @@ from typing import Protocol
 
 import httpx
 
+from . import load
 from .load import (
     BATCH_REQUESTS,
     LOAD_MIN_GAIN,
@@ -235,8 +236,8 @@ def brief(
 ) -> str:
     """What the model sees at each step."""
     ctx, slo, gpu = session.ctx, session.slo, session.ctx.gpu
-    load = load_records(session.run.path)
-    base = next((r for r in load if r["label"] == "baseline" and r.get("session") == session.id), None)
+    loaded = load_records(session.run.path)
+    base = next((r for r in loaded if r["label"] == "baseline" and r.get("session") == session.id), None)
     sampling = base.get("sampling") if base else None
     other = "batch" if target == "chat" else "chat"
     lines = [
@@ -294,11 +295,11 @@ def brief(
             "| batch KV cache peak | batch preemptions | attention backend"
         ),
     ]
-    for r in load:
+    for r in loaded:
         if r["status"] != "ok":
             lines.append(f"{r['label']} | {r['status']}: {r.get('error')}")
             continue
-        chat, batch = gains(r, session_baseline(load, r))
+        chat, batch = gains(r, session_baseline(loaded, r))
         b = r["batch"]
         lines.append(
             f"{r['label']} | {_f(r['capacity_rps'], '.2f')} ({_x(chat)}) | {_f((r['chat'] or {}).get('tpot_p90_ms'), '.1f')} "
@@ -310,7 +311,7 @@ def brief(
         lines += ["", "Your earlier picks in this session:", "config | expected chat, batch | outcome"]
         for j in journal:
             lines.append(f"{j['config']} | {_x(j['expected_chat'])}, {_x(j['expected_batch'])} | {j['result']}")
-    walls = [r["wall_s"] for r in load if r.get("session") == session.id]
+    walls = [r["wall_s"] for r in loaded if r.get("session") == session.id]
     each = f", about {sum(walls) / len(walls) / 60:.0f} minutes each" if walls else ""
     lines += ["", "Allowed configs, not loaded yet:", *(c.label() for c in options)]
     if untried:
@@ -425,7 +426,12 @@ def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Go
         return f"KL {r['kl']:.4f} offline, over the limit; no server started", False
     if same := session.same_engine(r):
         return f"runs the same engine as {same}; no server started", False
-    rec = session.measure(r)
+    try:
+        rec = session.measure(r)
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
+        # measure_config records a server that fails to start; one that dies once it answered raises out of it
+        load.wait_for_gpu(session.free_mib)
+        return f"the server stopped answering during measurement ({type(e).__name__}: {e}); no record", True
     started = rec.get("session") == session.id
     if rec["status"] != "ok":
         return f"{rec['status']}: {rec.get('error')}", started

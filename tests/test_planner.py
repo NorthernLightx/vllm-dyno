@@ -9,7 +9,17 @@ import pytest
 from vllm_dyno import load, planner
 from vllm_dyno.fit import FitProposer
 from vllm_dyno.load import LoadSession, Slo, load_records
-from vllm_dyno.planner import AllProposer, Llm, LlmProposer, PlannerError, Proposal, Step, allowed, parse, plan
+from vllm_dyno.planner import (
+    AllProposer,
+    Llm,
+    LlmProposer,
+    PlannerError,
+    Proposal,
+    Step,
+    allowed,
+    parse,
+    plan,
+)
 from vllm_dyno.report import load_recommendation
 from vllm_dyno.runner import Run
 from vllm_dyno.search import Goal
@@ -360,6 +370,30 @@ def test_the_all_planner_loads_every_allowed_config_in_order(tmp_path, monkeypat
     assert [j["config"] for j in journal] == [c.label() for c in allowed(ctx, SCREEN, max_kl=0.05)]
     assert next(j for j in journal if j["config"] == over)["server"] is False
     assert {(j["model"], j["tokens"], j["expected_chat"]) for j in journal} == {("all", None, None)}
+
+
+def test_a_server_that_stops_answering_during_measurement_ends_only_its_own_pick(tmp_path, monkeypatch, ctx):
+    dies = "kv_cache_dtype=int8_per_token_head"
+    s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [])
+    serves = load.measure_config
+
+    def measure_config(r, *args, **kwargs):
+        if r["label"] == dies:
+            measured.append(r["label"])
+            raise httpx.ConnectError("[Errno 111] Connection refused")
+        return serves(r, *args, **kwargs)
+
+    waits: list[int] = []
+    monkeypatch.setattr(load, "measure_config", measure_config)
+    monkeypatch.setattr(load, "wait_for_gpu", waits.append)
+    plan(s, AllProposer(), Goal(), "chat", max_servers=sys.maxsize, max_combos=8, trial_timeout_s=900)
+    journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
+    assert [j["config"] for j in journal] == [c.label() for c in allowed(ctx, SCREEN, max_kl=0.05)]
+    died = next(j for j in journal if j["config"] == dies)
+    assert died["server"] is True
+    assert died["result"].startswith("the server stopped answering during measurement (ConnectError")
+    assert dies not in {r["label"] for r in load_records(tmp_path)}
+    assert waits == [6000] * len(measured)  # the dead server's memory too, before the next one starts
 
 
 def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypatch, ctx):
