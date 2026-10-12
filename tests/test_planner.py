@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import asdict
 
 import httpx
@@ -6,7 +7,7 @@ import pytest
 
 from vllm_dyno import load, planner
 from vllm_dyno.load import LoadSession, Slo
-from vllm_dyno.planner import Llm, LlmProposer, PlannerError, Proposal, Step, allowed, parse, plan
+from vllm_dyno.planner import AllProposer, Llm, LlmProposer, PlannerError, Proposal, Step, allowed, parse, plan
 from vllm_dyno.runner import Run
 from vllm_dyno.search import Goal
 from vllm_dyno.space import KNOBS, Candidate
@@ -324,6 +325,31 @@ def test_the_rules_finish_the_session_when_any_proposer_stops_too_early_or_picks
     assert [(j["model"], j["config"], j["expected_chat"], j["tokens"]) for j in journal] == [
         ("scripted", "attention_backend=TRITON_ATTN", 1.2, None)
     ]
+
+
+def test_the_all_planner_loads_every_allowed_config_in_order(tmp_path, monkeypatch, ctx):
+    over = "weights=fp8 kv_cache_dtype=int8_per_token_head"
+    s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [], kl={over: 0.06})
+    plan(s, AllProposer(), Goal(), "chat", max_servers=sys.maxsize, max_combos=8, trial_timeout_s=900)
+    assert measured == [
+        "baseline",
+        "attention_backend=TRITON_ATTN",
+        "kv_cache_dtype=int8_per_token_head",
+        "kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN",
+        "weights=fp8",
+        "weights=fp8 attention_backend=TRITON_ATTN",
+        "weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN",
+    ]
+    journal = [json.loads(line) for line in (tmp_path / "plan.jsonl").read_text().splitlines()]
+    assert [j["config"] for j in journal] == [c.label() for c in allowed(ctx, SCREEN, max_kl=0.05)]
+    assert next(j for j in journal if j["config"] == over)["server"] is False
+    assert {(j["model"], j["tokens"], j["expected_chat"]) for j in journal} == {("all", None, None)}
+
+
+def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypatch, ctx):
+    s, _, measured, _ = setup(tmp_path, monkeypatch, ctx, [])
+    plan(s, AllProposer(), Goal(), "chat", max_servers=2, max_combos=8, trial_timeout_s=900)
+    assert measured == ["baseline", "attention_backend=TRITON_ATTN", "kv_cache_dtype=int8_per_token_head"]
 
 
 def test_a_stop_counts_only_once_no_setting_is_left_untried():

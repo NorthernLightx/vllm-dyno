@@ -233,15 +233,22 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
+def _expected(p: dict) -> str:
+    if not p["config"] or (p["expected_chat"] is None and p["expected_batch"] is None):
+        return ""
+    return f"{_ratio(p['expected_chat'])}, {_ratio(p['expected_batch'])}"
+
+
 def _plan_lines(picks: Sequence[dict]) -> list[str]:
     models = ", ".join(f"`{m}`" for m in dict.fromkeys(p["model"] for p in picks))
+    expected = ", with the gains it expected before they ran" if any(_expected(p) for p in picks) else ""
     lines = [
         "",
         "## Planner",
         "",
         (
-            f"{models} picked the configs to load after the baseline, in this order, with the gains it expected "
-            "before they ran. A combination it picked ran offline for quality before a server started."
+            f"{models} picked the configs to load after the baseline, in this order{expected}. "
+            "A combination it picked ran offline for quality before a server started."
         ),
         "",
     ]
@@ -249,7 +256,7 @@ def _plan_lines(picks: Sequence[dict]) -> list[str]:
         [
             str(i),
             f"`{p['config']}`" if p["config"] else "stop",
-            f"{_ratio(p['expected_chat'])}, {_ratio(p['expected_batch'])}" if p["config"] else "",
+            _expected(p),
             _cell(p["result"]),
             _cell(p["hypothesis"]),
         ]

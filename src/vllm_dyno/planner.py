@@ -11,7 +11,8 @@ An effect is known once two configs that served, or one and the baseline, differ
 a config that changes several untried settings at once shows none of their effects.
 
 LlmProposer asks a chat model through any OpenAI-compatible endpoint. It shows the model the machine,
-the offline trials, the load records so far and its earlier picks with what they measured.
+the offline trials, the load records so far and its earlier picks with what they measured. AllProposer
+loads every allowed config, which measures the whole space.
 
 If a proposer fails, such as an endpoint that fails or answers twice with something outside the list,
 the rules finish the session, reusing every config already loaded.
@@ -379,6 +380,16 @@ class LlmProposer:
         step.step_file.write_text(_step(messages, replies))
         tokens = {k: sum(int(r.usage.get(k) or 0) for r in replies) for k in TOKENS}
         return dataclasses.replace(p, tokens=tokens)
+
+
+class AllProposer:
+    """Every allowed config in the order of the list. It never stops, so plan() ends once none is left."""
+
+    name: str = "all"
+
+    def propose(self, step: Step) -> Proposal:
+        """The first allowed config."""
+        return Proposal(step.options[0], "the next allowed config; every one is loaded")
 
 
 def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Candidate]:

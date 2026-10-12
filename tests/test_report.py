@@ -226,10 +226,24 @@ def test_report_lists_the_planner_picks_with_expected_and_measured_gains(ctx, tm
         },
     ]
     text = render(meta(ctx), RECORDS, tmp_path, picks=picks)
-    assert "`org/model` picked the configs to load after the baseline" in text
+    assert "`org/model` picked the configs to load after the baseline, in this order, with the gains it" in text
     assert (
         "| 1 | `weights=fp8` | 1.10x, 1.20x | chat 11.31 req/s (1.13x), batch 2500 tok/s (1.25x), KL 0.0120 "
         r"| fp8 \| more KV |"
     ) in text
     assert "| 2 | stop |  | stop | nothing left |" in text
     assert "The endpoint counted 4,500 prompt tokens and 240 completion tokens." in text
+
+
+def test_report_lists_the_picks_of_a_planner_that_neither_expects_gains_nor_calls_an_endpoint(ctx, tmp_path):
+    entry = {"model": "all", "expected_chat": None, "expected_batch": None, "server": True, "tokens": None}
+    picks = [
+        entry | {"config": "weights=fp8", "hypothesis": "next", "result": "chat 11.31 req/s (1.13x)"},
+        entry | {"config": "attention_backend=TRITON_ATTN", "hypothesis": "next", "result": "chat 12.00 req/s"},
+    ]
+    text = render(meta(ctx), RECORDS, tmp_path, picks=picks)
+    assert (
+        "`all` picked the configs to load after the baseline, in this order. A combination it picked ran offline"
+    ) in text
+    assert "| 1 | `weights=fp8` |  | chat 11.31 req/s (1.13x) | next |" in text
+    assert "The endpoint counted" not in text

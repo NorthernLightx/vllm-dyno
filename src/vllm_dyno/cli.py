@@ -14,6 +14,7 @@ from pathlib import Path
 log = logging.getLogger("vllm_dyno")
 
 IGNORE_FILES = ["*.bin", "*.pth", "*.pt", "*.gguf", "*.onnx", "*.msgpack", "*.h5", "original/*"]
+MAX_SERVERS = 10  # the default budget of a planner that picks configs one at a time
 
 
 def _unwind_on_signals() -> None:
@@ -230,6 +231,21 @@ def _local(url: str) -> bool:
     return urlparse(url).hostname in ("localhost", "127.0.0.1")
 
 
+def _max_servers(planner: str, value: int | None) -> int:
+    """The servers a planner may start after the baseline: value if given, else MAX_SERVERS, or no cap for all."""
+    if value is not None:
+        return value
+    return sys.maxsize if planner == "all" else MAX_SERVERS
+
+
+def _proposer(args: argparse.Namespace, key: str | None):
+    from .planner import AllProposer, Llm, LlmProposer
+
+    if args.planner == "llm":
+        return LlmProposer(Llm(args.planner_url, args.planner_model, key))
+    return AllProposer()
+
+
 def cmd_load(args: argparse.Namespace) -> None:
     from .load import LOAD_SHA, LoadSession, Slo, load_goal, load_records, prompt_pool, targets
     from .planner import plan_records, take_key
@@ -289,20 +305,20 @@ def cmd_load(args: argparse.Namespace) -> None:
         for r in targets(run.records, args.config):
             if r["label"] != "baseline":
                 session.measure(r)
-    elif args.planner == "llm":
-        from .planner import Llm, LlmProposer, plan
+    elif args.planner == "rules":
+        session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
+    else:
+        from .planner import plan
 
         plan(
             session,
-            LlmProposer(Llm(args.planner_url, args.planner_model, key)),
+            _proposer(args, key),
             Goal(**run.meta["goal"]),
             args.goal,
-            max_servers=args.max_servers,
+            max_servers=_max_servers(args.planner, args.max_servers),
             max_combos=args.max_combos,
             trial_timeout_s=args.trial_timeout,
         )
-    else:
-        session.search(Goal(**run.meta["goal"]), args.max_combos, args.trial_timeout)
     text = render(
         run.meta,
         run.records,
@@ -412,9 +428,12 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
     load.add_argument(
         "--planner",
-        choices=["rules", "llm"],
+        choices=["rules", "llm", "all"],
         default="rules",
-        help="rules: every setting, then combinations of those that gained; llm: a model picks each config",
+        help=(
+            "rules: every setting, then combinations of those that gained; llm: a model picks each config; "
+            "all: every allowed config, to measure the whole space"
+        ),
     )
     load.add_argument(
         "--planner-url", default="https://openrouter.ai/api/v1", help="OpenAI-compatible endpoint of the llm planner"
@@ -427,7 +446,11 @@ def main(argv: list[str] | None = None) -> None:
         default="OPENROUTER_API_KEY",
         help="environment variable holding the endpoint's API key; unset or empty sends none",
     )
-    load.add_argument("--max-servers", type=int, default=10, help="configs the llm planner may load after the baseline")
+    load.add_argument(
+        "--max-servers",
+        type=int,
+        help=f"servers the llm or all planner may start after the baseline (default {MAX_SERVERS}; no cap for all)",
+    )
     load.add_argument(
         "--trial-timeout", type=float, default=900, help="seconds before a combination's quality trial is killed"
     )
