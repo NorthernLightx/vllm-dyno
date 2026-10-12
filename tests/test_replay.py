@@ -227,6 +227,42 @@ def test_a_config_no_run_recorded_ends_its_repeat_as_a_gap(tmp_path, monkeypatch
     assert f"`{FP8_INT8}`, no {kind} record: 2" in replay.markdown(result)
 
 
+class Scripted:
+    """Picks the configs of a script in turn, then the first config left; raises an exception the script holds."""
+
+    name = "scripted"
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+
+    def propose(self, step):
+        pick = self.script.pop(0) if self.script else step.options[0]
+        if isinstance(pick, Exception):
+            raise pick
+        return planner.Proposal(cand(pick) if isinstance(pick, str) else pick, "scripted")
+
+
+def test_a_planner_that_fails_ends_its_repeat_as_a_fallback_the_rules_do_not_finish(tmp_path, monkeypatch, ctx):
+    path = rules_run(tmp_path, monkeypatch, ctx)
+    script = [FP8_INT8, planner.PlannerError("HTTP 401: no key")]
+    monkeypatch.setattr(replay, "proposer", lambda name, seed, llm: Scripted(script))
+    search = LoadSession.search
+    result = replay.replay([path], "scripted", repeats=2, max_servers=3, max_combos=8, seed=0, target="chat")
+    assert LoadSession.search is search
+    for o in result["repeats"]:
+        assert (o["fallback"], o["loaded"], o["pick"]) == (
+            {"step": 2, "error": "HTTP 401: no key"},
+            ["baseline", FP8_INT8],
+            None,
+        )
+    s = result["summary"]
+    assert (s["completed"], s["gaps"], s["fallbacks"], s["servers"], s["exact"]) == (0, 0, 2, None, None)
+    assert s["fallback_errors"] == [{"error": "HTTP 401: no key", "repeats": 2}]
+    text = replay.markdown(result)
+    assert "| scripted | 3 | 2 | 0 | 2 |  |  |  |  |  |  |" in text
+    assert "- HTTP 401: no key: 2" in text
+
+
 def test_a_config_that_names_the_backend_its_twin_picked_runs_the_twins_engine(tmp_path, monkeypatch, ctx):
     rec = replay.recorded([rules_run(tmp_path, monkeypatch, ctx)])
     best = replay.truth(rec, "chat")
@@ -332,7 +368,7 @@ def test_replay_prints_a_summary_and_writes_every_repeat(tmp_path, monkeypatch, 
     out = tmp_path / "replay.json"
     main(["replay", str(path), "--repeats", "2", "--out", str(out)])
     text = capsys.readouterr().out
-    assert "| rules |  | 2 | 0 | 5.0 | 40 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
+    assert "| rules |  | 2 | 0 | 0 | 5.0 | 40 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
     assert f"Truth: `{FP8_INT8}`; tied with it: `{FP8_INT8_TRITON}`." in text
     written = json.loads(out.read_text())
     assert (written["planner"], len(written["repeats"]), written["summary"]["gaps"]) == ("rules", 2, 0)

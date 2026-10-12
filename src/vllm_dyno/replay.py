@@ -9,7 +9,9 @@ A server's measurement is one load record of its config drawn at random, with it
 the baseline of its own session applied to a baseline record drawn once per repeat, so every ratio
 a session sees is a ratio that was measured. A config naming the attention backend its auto-backend
 twin's server picked anyway runs the same engine, and shares the twin's records. A config that no
-run measured, under load or offline, ends its repeat as a gap: nothing is estimated.
+run measured, under load or offline, ends its repeat as a gap: nothing is estimated. A proposer that
+fails ends its repeat as a fallback: `dyno load` hands its session to the rules, whose pick is not
+the proposer's.
 
 The truth is the recommendation report.load_recommendation makes over every config's mean gains,
 together with the configs it counts as tied. Each repeat is scored by the config its own records
@@ -66,6 +68,14 @@ class ReplayGap(Exception):
     def __init__(self, label: str, kind: str):
         super().__init__(f"no {kind} record of {label}")
         self.label, self.kind = label, kind
+
+
+class HandedOver(Exception):
+    """The proposer failed, and plan() handed its session to the rules search."""
+
+
+def _hand_over(session: LoadSession, goal: Goal, max_combos: int, trial_timeout_s: float) -> None:
+    raise HandedOver
 
 
 @dataclass(frozen=True)
@@ -295,7 +305,7 @@ def repeat(rec: Recorded, best: Truth, drive: Drive, i: int, seed: int, target: 
     """Repeat i: one session in a fresh run directory, driven by drive, and how its recommendation scores."""
     rng = random.Random(f"{seed} {i}")  # a string seed keeps the streams of nearby seeds apart
     base = rng.choice(rec.baselines)
-    gap = None
+    gap = handed = None
     with tempfile.TemporaryDirectory(prefix="dyno-replay-") as tmp:
         path = Path(tmp)
         (path / "run.json").write_text(json.dumps(rec.meta))
@@ -317,9 +327,13 @@ def repeat(rec: Recorded, best: Truth, drive: Drive, i: int, seed: int, target: 
                 drive(session, rng.randrange(2**31))
         except ReplayGap as e:
             gap = {"config": e.label, "kind": e.kind}
+        except HandedOver as e:
+            handed = e
         served = load_records(path)
         records = list(run.records)
         picks = planner.plan_records(path)
+    # plan() hands over from inside the except clause that caught the proposer's error
+    fallback = {"step": len(picks) + 1, "error": str(handed.__context__)} if handed else None
     outcome = {
         "repeat": i,
         "loaded": [r["label"] for r in served],
@@ -328,8 +342,9 @@ def repeat(rec: Recorded, best: Truth, drive: Drive, i: int, seed: int, target: 
         "tokens": _tokens(picks),
         "plan": picks,
         "gap": gap,
+        "fallback": fallback,
     }
-    found = None if gap else load_recommendation(served, records, Goal(**rec.meta["goal"]), target)
+    found = None if gap or fallback else load_recommendation(served, records, Goal(**rec.meta["goal"]), target)
     if found is None:
         return outcome | {"pick": None, "exact": False, "tied": False, "chat": None, "batch": None, "regret": None}
     pick = candidate_of(found[0])
@@ -489,30 +504,35 @@ def proposer(name: str, seed: int, llm: Llm | None) -> Proposer:
 
 
 def driver(name: str, goal: Goal, target: str, *, max_servers: int, max_combos: int, llm: Llm | None) -> Drive:
-    """How a session runs with the named planner: the rules search, or plan() with a fresh proposer."""
+    """How a session runs with the named planner: the rules search, or plan() with a fresh proposer.
+
+    Under plan(), the rules search raises HandedOver instead of finishing a session the proposer failed.
+    """
 
     def drive(session: LoadSession, seed: int) -> None:
         if name == "rules":
             session.search(goal, max_combos, TRIAL_TIMEOUT_S)
             return
-        planner.plan(
-            session,
-            proposer(name, seed, llm),
-            goal,
-            target,
-            max_servers=max_servers,
-            max_combos=max_combos,
-            trial_timeout_s=TRIAL_TIMEOUT_S,
-        )
+        with mock.patch.object(LoadSession, "search", _hand_over):
+            planner.plan(
+                session,
+                proposer(name, seed, llm),
+                goal,
+                target,
+                max_servers=max_servers,
+                max_combos=max_combos,
+                trial_timeout_s=TRIAL_TIMEOUT_S,
+            )
 
     return drive
 
 
 def summarize(outcomes: list[dict]) -> dict:
-    """Means over the repeats that ended without a gap, and the configs the others asked for."""
-    done = [o for o in outcomes if o["gap"] is None]
+    """Means over the repeats that ended without a gap or a fallback; the gaps' configs and the proposers' errors."""
+    done = [o for o in outcomes if o["gap"] is None and o["fallback"] is None]
     regrets = [o["regret"] for o in done if o["regret"] is not None]
     gaps = Counter((o["gap"]["config"], o["gap"]["kind"]) for o in outcomes if o["gap"])
+    errors = Counter(o["fallback"]["error"] for o in outcomes if o["fallback"])
     return {
         "repeats": len(outcomes),
         "completed": len(done),
@@ -522,11 +542,15 @@ def summarize(outcomes: list[dict]) -> dict:
         "tied": fmean(o["tied"] for o in done) if done else None,
         "regret_mean": fmean(regrets) if regrets else None,
         "regret_worst": max(regrets) if regrets else None,
-        "gaps": len(outcomes) - len(done),
+        "gaps": sum(gaps.values()),
+        "fallbacks": sum(errors.values()),
         "tokens": _tokens([o for o in outcomes if o["tokens"]]),
         "gap_configs": [
             {"config": config, "kind": kind, "repeats": n}
             for (config, kind), n in sorted(gaps.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "fallback_errors": [
+            {"error": error, "repeats": n} for error, n in sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))
         ],
     }
 
@@ -550,14 +574,13 @@ def replay(
     outcomes = []
     for i in range(repeats):
         outcome = repeat(rec, best, drive, i, seed, target)
-        log.info(
-            "replay   %d/%d  %s",
-            i + 1,
-            repeats,
-            f"gap: {outcome['gap']['config']}"
-            if outcome["gap"]
-            else f"{outcome['servers']} servers, {outcome['pick']}",
-        )
+        if outcome["gap"]:
+            ended = f"gap: {outcome['gap']['config']}"
+        elif outcome["fallback"]:
+            ended = f"{name} failed at step {outcome['fallback']['step']}: {outcome['fallback']['error']}"
+        else:
+            ended = f"{outcome['servers']} servers, {outcome['pick']}"
+        log.info("replay   %d/%d  %s", i + 1, repeats, ended)
         outcomes.append(outcome)
     records = rec.records()
     configs = []
@@ -607,16 +630,18 @@ def markdown(result: dict) -> str:
         (
             f"`{result['planner']}` over {len(result['runs'])} runs of `{result['model']}` (load code "
             f"{result['load_sha']}), goal {result['goal']}, seed {result['seed']}. Means are over the repeats "
-            "that ended without a gap; regret is the truth's mean gain on the goal over the pick's."
+            "that ended without a gap or a fallback to the rules; regret is the truth's mean gain on the goal "
+            "over the pick's."
         ),
         "",
     ]
-    header = ["planner", "max servers", "repeats", "gaps", "servers", "GPU min", "exact", "tied", "regret mean"]
+    header = ["planner", "max servers", "repeats", "gaps", "fallbacks", "servers", "GPU min", "exact", "tied"]
     row = [
         result["planner"],
         budget,
         str(s["repeats"]),
         str(s["gaps"]),
+        str(s["fallbacks"]),
         _num(s["servers"], ".1f"),
         _num(s["gpu_min"], ".0f"),
         _num(s["exact"], ".2f"),
@@ -624,13 +649,16 @@ def markdown(result: dict) -> str:
         _num(s["regret_mean"], ".3f"),
         _num(s["regret_worst"], ".3f"),
     ]
-    lines += _table([*header, "regret worst"], [row])
+    lines += _table([*header, "regret mean", "regret worst"], [row])
     if s["tokens"]:
         prompt, completion = (s["tokens"][k] for k in planner.TOKENS)
         lines += ["", f"The endpoint counted {prompt:,} prompt and {completion:,} completion tokens in all repeats."]
     if s["gap_configs"]:
         lines += ["", "Repeats that asked for a config no run recorded:", ""]
         lines += [f"- `{g['config']}`, no {g['kind']} record: {g['repeats']}" for g in s["gap_configs"]]
+    if s["fallback_errors"]:
+        lines += ["", "Repeats whose planner failed, which `dyno load` would hand to the rules:", ""]
+        lines += [f"- {f['error']}: {f['repeats']}" for f in s["fallback_errors"]]
     lines += [
         "",
         f"Truth: `{t['pick']}`; tied with it: {', '.join(f'`{c}`' for c in t['tied'][1:]) or 'none'}.",
