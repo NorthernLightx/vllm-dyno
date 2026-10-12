@@ -34,6 +34,17 @@ def test_a_crash_after_memory_profiling_is_not_an_oom():
     assert classify(PROFILED + failed(cause)) == ("crash", cause)
 
 
+def test_an_oom_that_aborts_in_cpp_is_found_without_an_exception_line():
+    aborted = (
+        "terminate called after throwing an instance of 'c10::OutOfMemoryError'\n"
+        "  what():  CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 8.00 GiB "
+        "of which 0 bytes is free.\n"
+    )
+    status, error = classify(PROFILED + aborted)
+    assert status == "oom"
+    assert "CUDA out of memory" in error
+
+
 VLLM_MEMORY_ERRORS = [
     (
         "ValueError: To serve at least one request with the model's max seq len (2048), (0.22 GiB KV cache is "
