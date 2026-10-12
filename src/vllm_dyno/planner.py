@@ -413,7 +413,7 @@ def untried(session: LoadSession, options: list[Candidate]) -> list[str]:
 def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Goal) -> tuple[str, bool]:
     """Run the pick: its quality trial if it combines settings, then a server if it is within the KL limit.
 
-    The outcome as the model sees it, and whether a server started for it in this session.
+    The outcome as the journal records it, and whether a server started for it in this session.
     """
     if len(cand.changes()) == 1:
         r = next(r for r in session.run.records if r["stage"] == "screen" and r["label"] == cand.label())
