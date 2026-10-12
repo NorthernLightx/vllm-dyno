@@ -421,16 +421,31 @@ def test_search_loads_settings_within_quality_then_combines_those_that_gained(tm
     ]
 
 
-def measure(tmp_path, monkeypatch, ctx, after: float | None, lone: float = 8.5, label: str = "weights=fp8") -> dict:
+def measure(
+    tmp_path,
+    monkeypatch,
+    ctx,
+    after: float | None,
+    lone: float = 8.5,
+    label: str = "weights=fp8",
+    compiles: int = 0,
+    starts: list | None = None,
+) -> dict:
     """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran.
 
-    Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline.
+    Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline. The first
+    `compiles` starts compile the model's graph and get a smaller KV cache; each start is appended to `starts`.
     """
     batched, lone_params, warmup_sizes = [], [], []
+    starts = [] if starts is None else starts
 
     @contextlib.contextmanager
     def fake_serving(argv, log_path, env, timeout_s):
-        log_path.write_text("GPU KV cache size: 44,624 tokens\n")
+        starts.append(argv)
+        if len(starts) <= compiles:
+            log_path.write_text(f"{load.COMPILED_LINE} to /cache\nGPU KV cache size: 28,000 tokens\n")
+        else:
+            log_path.write_text("GPU KV cache size: 44,624 tokens\n")
         yield "http://server"
 
     async def fake_send(url, model, prompts, starts, max_tokens, slo=None, *, params=None, **kwargs):
@@ -492,6 +507,17 @@ def test_a_server_slower_after_batch_than_at_its_first_probe_is_degraded(
     # a degraded record keeps its numbers for diagnosis
     assert record["capacity_rps"] == pytest.approx(20, rel=load.PRECISION)
     assert (record["batch"]["tput_tok_s"], record["kv_tokens"], record["lone_tpot_ms"]) == (2900, 44624, 8.5)
+
+
+@pytest.mark.parametrize(("compiles", "kv_tokens", "started"), [(0, 44624, 1), (1, 44624, 2), (2, 28000, 2)])
+def test_a_server_whose_start_compiled_the_graph_is_measured_after_a_second_start(
+    tmp_path, monkeypatch, ctx, compiles, kv_tokens, started
+):
+    starts = []
+    record = measure(tmp_path, monkeypatch, ctx, 8.9, compiles=compiles, starts=starts)
+    assert (record["status"], record["kv_tokens"], len(starts)) == ("ok", kv_tokens, started)
+    assert len(set(map(tuple, starts))) == 1
+    assert (tmp_path / "server-compile.log").exists() == (compiles > 0)
 
 
 def test_a_server_that_decodes_a_lone_request_much_slower_than_offline_is_not_measured(tmp_path, monkeypatch, ctx):

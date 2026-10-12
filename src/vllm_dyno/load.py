@@ -15,6 +15,9 @@ and attention backends differ in how much a prefill slows the decodes beside it.
 Every request carries its own cache_salt, so prompts from the pool can repeat without prefix
 caching shortcutting prefill. The server keeps vLLM's serving defaults, which differ from the
 offline engine's: below 70 GiB of GPU memory, max_num_batched_tokens is 2048 instead of 8192.
+So a config's offline trial does not compile the graph its server runs, and a server whose start
+compiled it is started again, from vLLM's compile cache, before it is measured: a start that
+compiles leaves less memory for the KV cache.
 
 Measured requests leave sampling to the server, which applies the model's generation_config as it
 would for any client that sets nothing, so the penalties and top-k/top-p a model asks for are part of
@@ -86,6 +89,7 @@ WARMUP_TOKENS = 4
 KV_LINE = re.compile(r"GPU KV cache size: ([\d,]+) tokens")
 BACKEND_LINE = re.compile(r"Using (?:AttentionBackendEnum\.)?([A-Z0-9_]+) (?:attention )?backend")
 SAMPLING_LINE = re.compile(r"overridden by the model's `generation_config.json`: `(\{.*?\})`")
+COMPILED_LINE = "saved AOT compiled function"  # vLLM compiled the model's graph rather than load it from its cache
 # smaller gains are within noise: a repeated measurement can land one bisection step apart,
 # and the steps find_capacity takes near the limit are up to 9% wide
 LOAD_MIN_GAIN = 0.1
@@ -471,6 +475,23 @@ def serving(argv: list[str], log_path: Path, env: dict[str, str], timeout_s: flo
             proc.wait()
 
 
+@contextlib.contextmanager
+def serving_from_cache(argv: list[str], log_path: Path, env: dict[str, str], timeout_s: float) -> Generator[str]:
+    """serving(), started a second time if the first start compiled the model's graph.
+
+    vLLM sizes the KV cache from the activation peak of its start, and a start that compiles
+    reports a higher peak than one that loads the graph from vLLM's compile cache. The first
+    start's log is kept as server-compile.log.
+    """
+    with serving(argv, log_path, env, timeout_s) as url:
+        if COMPILED_LINE not in log_path.read_text(errors="replace"):
+            yield url
+            return
+    log_path.replace(log_path.with_name("server-compile.log"))
+    with serving(argv, log_path, env, timeout_s) as url:
+        yield url
+
+
 def targets(records: list[dict], labels: list[str]) -> list[dict]:
     """The trial record of each named config."""
     out = []
@@ -523,7 +544,7 @@ def measure_config(
     record = {"label": r["label"], **asdict(cand), "slo": asdict(slo), "load_sha": LOAD_SHA}
     probes: list[dict] = []
     try:
-        with serving(shlex.split(serve_command(cand, ctx)), log_path, env, timeout_s) as url:
+        with serving_from_cache(shlex.split(serve_command(cand, ctx)), log_path, env, timeout_s) as url:
             started_log = log_path.read_text(errors="replace")
             kv, backends = KV_LINE.search(started_log), attention_backends(started_log)
             sampling = SAMPLING_LINE.search(started_log)
