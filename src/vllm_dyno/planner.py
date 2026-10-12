@@ -394,8 +394,12 @@ class AllProposer:
 
 
 def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Candidate]:
-    """Allowed configs not loaded in any session, not picked in this one, and not over the KL limit offline."""
-    done = {r["label"] for r in load_records(session.run.path)} | {j["config"] for j in journal}
+    """Allowed configs not loaded in any session, not picked in this one, and not over the KL limit offline.
+
+    A config whose every load record is degraded counts as not loaded, as LoadSession.measure serves it again.
+    """
+    done = {r["label"] for r in load_records(session.run.path) if r["status"] != "degraded"}
+    done |= {j["config"] for j in journal}
     failed = {
         r["label"]
         for r in session.run.records

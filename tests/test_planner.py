@@ -19,6 +19,7 @@ from vllm_dyno.planner import (
     allowed,
     parse,
     plan,
+    remaining,
 )
 from vllm_dyno.report import load_recommendation
 from vllm_dyno.runner import Run
@@ -394,6 +395,25 @@ def test_a_server_that_stops_answering_during_measurement_ends_only_its_own_pick
     assert died["result"].startswith("the server stopped answering during measurement (ConnectError")
     assert dies not in {r["label"] for r in load_records(tmp_path)}
     assert waits == [6000] * len(measured)  # the dead server's memory too, before the next one starts
+
+
+def test_a_config_whose_every_earlier_load_degraded_is_offered_again(tmp_path, monkeypatch, ctx):
+    s, _, _, _ = setup(tmp_path, monkeypatch, ctx, [])
+    earlier = [
+        ("weights=fp8", "degraded"),
+        ("attention_backend=TRITON_ATTN", "ok"),
+        ("kv_cache_dtype=int8_per_token_head", "degraded"),
+        ("kv_cache_dtype=int8_per_token_head", "ok"),
+    ]
+    (tmp_path / "load.jsonl").write_text(
+        "".join(
+            json.dumps({"label": label, "status": status, "session": "earlier"}) + "\n" for label, status in earlier
+        )
+    )
+    labels = {c.label() for c in remaining(s, Goal(), [])}
+    assert "weights=fp8" in labels
+    assert not {"attention_backend=TRITON_ATTN", "kv_cache_dtype=int8_per_token_head"} & labels
+    assert "weights=fp8" not in {c.label() for c in remaining(s, Goal(), [{"config": "weights=fp8"}])}
 
 
 def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypatch, ctx):
