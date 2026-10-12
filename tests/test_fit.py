@@ -7,7 +7,7 @@ import pytest
 
 from vllm_dyno import fit
 from vllm_dyno.fit import FitProposer, posterior, prior_mean
-from vllm_dyno.load import LoadSession, Slo
+from vllm_dyno.load import MIN_RATE, LoadSession, Slo
 from vllm_dyno.planner import Step, remaining, untried
 from vllm_dyno.runner import Run
 from vllm_dyno.search import Goal
@@ -28,8 +28,8 @@ def screen(label: str, tput: float, kl: float) -> dict:
     }
 
 
-def served(label: str, chat: float, batch: float) -> dict:
-    """A load record of session s."""
+def served(label: str, chat: float | None, batch: float) -> dict:
+    """A load record of session s; chat None if even the lowest rate missed the SLO."""
     c = cand(label)
     return {"label": label, **asdict(c), "status": "ok", "error": None, "session": "s"} | {
         "capacity_rps": chat,
@@ -129,6 +129,16 @@ def test_it_does_not_stop_while_a_setting_is_untried_however_unlikely_the_config
     assert p.hypothesis.startswith("Settles attention_backend against ")
     wins = {c["config"]: c["win"] for c in json.loads(s.step_file.read_text())["configs"]}
     assert wins[p.config.label()] < fit.STOP_P
+
+
+def test_a_config_that_missed_the_slo_at_every_rate_drags_down_the_chat_of_its_combinations(tmp_path, ctx):
+    loads = [served("baseline", 10, 1000), served(FP8, None, 1500)]
+    s = step(tmp_path, ctx, SETTLED, loads)
+    model = fit.fit(s.session.run.records, loads, s.options)
+    for label in (FP8, f"{FP8} {INT8}", f"{FP8} {TRITON}"):
+        assert model.predicted_gains(cand(label))["chat"][0] < 2 * MIN_RATE / 10
+    p = FitProposer().propose(s)  # settles the KV cache dtype or the backend without fp8
+    assert p.config is not None and p.config.weights == "base"
 
 
 def test_a_config_over_the_kl_limit_never_wins(tmp_path, ctx):

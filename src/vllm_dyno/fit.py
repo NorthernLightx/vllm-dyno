@@ -23,7 +23,7 @@ import random
 from dataclasses import dataclass
 from statistics import NormalDist
 
-from .load import gains, load_records, session_baseline
+from .load import MIN_RATE, gains, load_records, session_baseline
 from .planner import Proposal, Step
 from .report import load_scores, load_winner, quality
 from .search import Goal, candidate_of
@@ -153,8 +153,13 @@ def fit(records: list[dict], load: list[dict], cands: list[Candidate]) -> Fit:
     rows: dict[str, tuple[list[list[float]], list[float]]] = {"chat": ([], []), "batch": ([], [])}
     for r in served:
         changed = set(candidate_of(r).changes().items())
-        for name, g in zip(("chat", "batch"), gains(r, session_baseline(load, r))):
-            if g:  # None without a baseline to compare with, 0 if even the lowest rate failed: no log gain
+        base = session_baseline(load, r)
+        chat, batch = gains(r, base)
+        if chat == 0 and base is not None:
+            # even MIN_RATE failed, so the gain is below MIN_RATE over the baseline's: the bound stands in for it
+            chat = MIN_RATE / base["capacity_rps"]
+        for name, g in (("chat", chat), ("batch", batch)):
+            if g:  # None without a baseline to compare with; a batch that finished no request has no log gain
                 rows[name][0].append([float(v in changed) for v in values])
                 rows[name][1].append(math.log(g))
     return Fit(values, posterior(*rows["chat"], prior), posterior(*rows["batch"], prior))
