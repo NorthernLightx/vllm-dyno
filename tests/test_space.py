@@ -33,6 +33,16 @@ def test_rules_explain_known_failures(ctx):
     assert infeasible_reason(Candidate(), ctx) is None
 
 
+def test_a_turboquant_kv_cache_leaves_the_attention_backend_to_vllm(ctx):
+    assert infeasible_reason(Candidate(kv_cache_dtype="turboquant_k8v4"), ctx) is None
+    triton = Candidate(kv_cache_dtype="turboquant_k8v4", attention_backend="TRITON_ATTN")
+    assert reason(triton, ctx).endswith("TURBOQUANT backend, not on TRITON_ATTN")
+    flashinfer = Candidate(kv_cache_dtype="turboquant_k8v4", attention_backend="FLASHINFER")
+    assert "nvcc" in reason(flashinfer, ctx)
+    with_nvcc = dataclasses.replace(ctx, host={**ctx.host, "nvcc": True})
+    assert reason(flashinfer, with_nvcc).endswith("TURBOQUANT backend, not on FLASHINFER")
+
+
 def test_fp8_kv_is_allowed_when_nvcc_exists(ctx):
     with_nvcc = dataclasses.replace(ctx, host={**ctx.host, "nvcc": True})
     assert infeasible_reason(Candidate(kv_cache_dtype="fp8"), with_nvcc) is None

@@ -1,4 +1,6 @@
-from vllm_dyno.search import Goal, combinations, finalists, promising
+from vllm_dyno import search
+from vllm_dyno.runner import Run
+from vllm_dyno.search import Goal, Searcher, combinations, finalists, promising
 from vllm_dyno.space import Candidate
 
 
@@ -50,6 +52,30 @@ def test_latency_goal_ranks_by_time_per_token():
 def test_combinations_pair_settings_from_different_knobs():
     combos = combinations(promising(SCREEN, Goal()), limit=6)
     assert combos == [Candidate(weights="fp8", attention_backend="TRITON_ATTN")]
+
+
+def test_combine_skips_a_turboquant_kv_cache_with_a_named_backend(tmp_path, monkeypatch, ctx):
+    screen = [*SCREEN, rec("screen", 1150, kl=0.001, kv_cache_dtype="turboquant_k8v4")]
+    ran: list[Candidate] = []
+
+    def run_trial(_run, _ctx, stage, cand, _tier, **_kwargs):
+        ran.append(cand)
+        return {**rec(stage, 1300, **cand.changes()), "wall_s": 1.0}
+
+    monkeypatch.setattr(search, "run_trial", run_trial)
+    combos = combinations(promising(screen, Goal()), limit=6)
+    assert Candidate(kv_cache_dtype="turboquant_k8v4", attention_backend="TRITON_ATTN") in combos
+    records = Searcher(Run(tmp_path), ctx, Goal(), env={}, timeout_s=1).stage("combine", combos, search.SCREEN)
+    assert ran == [
+        Candidate(weights="fp8", kv_cache_dtype="turboquant_k8v4"),
+        Candidate(weights="fp8", attention_backend="TRITON_ATTN"),
+    ]
+    skipped = [r for r in records if r["status"] == "skipped"]
+    assert [r["label"] for r in skipped] == [
+        "weights=fp8 kv_cache_dtype=turboquant_k8v4 attention_backend=TRITON_ATTN",
+        "kv_cache_dtype=turboquant_k8v4 attention_backend=TRITON_ATTN",
+    ]
+    assert all("turboquant KV cache" in r["error"] for r in skipped)
 
 
 def test_finalists_are_the_best_passing_non_baseline_configs():

@@ -140,6 +140,8 @@ def infeasible_reason(c: Candidate, ctx: Context) -> str | None:
         return "fp8 KV cache below compute capability 8.9 needs FlashInfer, which compiles with nvcc (not on PATH)"
     if c.attention_backend.startswith("FLASHINFER") and not nvcc:
         return "FlashInfer compiles its kernels with nvcc, which is not on PATH"
+    if c.kv_cache_dtype.startswith("turboquant_") and c.attention_backend != "auto":
+        return f"vLLM runs a turboquant KV cache only on its own TURBOQUANT backend, not on {c.attention_backend}"
     if c.weights == "fp8" and cc < 8.0:
         return "fp8 weight-only kernels need compute capability 8.0+"
     if ckpt and ckpt.method == "gptq" and ckpt.bits not in (4, 8):

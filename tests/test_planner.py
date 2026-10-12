@@ -52,6 +52,13 @@ def test_the_planner_may_pick_combinations_of_values_that_each_passed_quality(ct
     ]
 
 
+def test_the_planner_may_not_name_a_backend_for_a_turboquant_kv_cache(ctx):
+    screen = [*SCREEN, trial("screen", "kv_cache_dtype=turboquant_k8v4", 0.0009)]
+    labels = [c.label() for c in allowed(ctx, screen, max_kl=0.05)]
+    assert "weights=fp8 kv_cache_dtype=turboquant_k8v4" in labels
+    assert [label for label in labels if "turboquant" in label and "TRITON_ATTN" in label] == []
+
+
 def test_a_reply_names_an_allowed_config_in_any_order_or_stops():
     options = [cand("weights=fp8 attention_backend=TRITON_ATTN"), cand("weights=fp8")]
     reply = (
