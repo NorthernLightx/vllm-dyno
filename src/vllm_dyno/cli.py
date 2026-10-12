@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from dataclasses import asdict
@@ -13,6 +14,17 @@ from pathlib import Path
 log = logging.getLogger("vllm_dyno")
 
 IGNORE_FILES = ["*.bin", "*.pth", "*.pt", "*.gguf", "*.onnx", "*.msgpack", "*.h5", "original/*"]
+
+
+def _unwind_on_signals() -> None:
+    """Turn SIGTERM and SIGHUP into SystemExit, as Python turns SIGINT into KeyboardInterrupt.
+
+    Servers and trials run in sessions of their own, out of reach of a signal sent to dyno's, and only
+    the cleanup that unwinding runs stops them. A SIGHUP that nohup ignores stays ignored.
+    """
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is signal.SIG_DFL:
+            signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
 
 
 def _setup_logging(logfile: Path | None) -> None:
@@ -418,4 +430,5 @@ def main(argv: list[str] | None = None) -> None:
     if args.command is None:
         parser.print_help()
         return
+    _unwind_on_signals()
     args.func(args)
