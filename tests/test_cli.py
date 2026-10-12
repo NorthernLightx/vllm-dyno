@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from vllm_dyno import cli
 from vllm_dyno.cli import main
 from vllm_dyno.runner import HARNESS_SHA
 
@@ -30,6 +31,23 @@ def test_a_server_stops_with_dyno_when_dyno_is_terminated(tmp_path, sig):
     assert proc.wait(timeout=30) == 128 + sig
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_engines_start_with_the_hub_offline_once_every_model_the_run_loads_is_cached(monkeypatch, ctx):
+    import huggingface_hub
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    cached = {"org/base"}
+
+    def lookup(repo, revision=None, local_files_only=False):
+        if not local_files_only or repo not in cached:
+            raise LocalEntryNotFoundError(repo)
+        return f"/cache/{repo}"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lookup)
+    assert cli._hub_offline({"PATH": "/bin"}, ctx) == {"PATH": "/bin"}
+    cached.add("org/base-AWQ")  # the 3-bit GPTQ checkpoint cannot run on sm86, so it is never loaded
+    assert cli._hub_offline({"PATH": "/bin"}, ctx) == {"PATH": "/bin", "HF_HUB_OFFLINE": "1"}
 
 
 def test_version_prints_package_version(capsys):

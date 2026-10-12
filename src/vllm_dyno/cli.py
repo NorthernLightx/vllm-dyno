@@ -111,16 +111,38 @@ def _log_plan(ctx) -> None:
         log.info("plan     %-55s %s", cand.label(), f"skip: {reason}" if reason else "run")
 
 
+def _repos(ctx) -> dict[str, str | None]:
+    """The model repos a run loads, each with the revision it measures."""
+    from .space import infeasible_reason, screen_candidates
+
+    runnable = {c.weights for c in screen_candidates(ctx) if not infeasible_reason(c, ctx)}
+    return {ctx.model: ctx.revision} | {c.repo: c.revision for c in ctx.checkpoints if c.repo in runnable}
+
+
+def _hub_offline(env: dict[str, str], ctx) -> dict[str, str]:
+    """env with the Hugging Face Hub offline if the cache holds every repo the run loads.
+
+    vLLM lists a repo's files on the Hub each time an engine starts, and the engine fails when the
+    lookup does, though every file it needs is cached.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        for repo, revision in _repos(ctx).items():
+            snapshot_download(repo, revision=revision, local_files_only=True)
+    except LocalEntryNotFoundError:
+        return env
+    return env | {"HF_HUB_OFFLINE": "1"}
+
+
 def _prepare(run, ctx, args) -> None:
     from huggingface_hub import snapshot_download
 
     from . import data
     from .search import CONFIRM, POOL_SIZE
-    from .space import infeasible_reason, screen_candidates
 
-    runnable = {c.weights for c in screen_candidates(ctx) if not infeasible_reason(c, ctx)}
-    repos = {ctx.model: ctx.revision} | {c.repo: c.revision for c in ctx.checkpoints if c.repo in runnable}
-    for repo, revision in sorted(repos.items()):
+    for repo, revision in sorted(_repos(ctx).items()):
         log.info("download %s@%s", repo, (revision or "")[:8])
         snapshot_download(repo, revision=revision, ignore_patterns=IGNORE_FILES)
     log.info("data     tokenizing %s", args.text or "WikiText-2")
@@ -183,7 +205,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         run.write_meta(meta)
         _prepare(run, ctx, args)
 
-    searcher = Searcher(run, ctx, goal, env=env, timeout_s=args.trial_timeout)
+    searcher = Searcher(run, ctx, goal, env=_hub_offline(env, ctx), timeout_s=args.trial_timeout)
     searcher.search(confirm_top=args.confirm_top, max_combos=args.max_combos)
     (out / "report.md").write_text(
         render(run.meta, run.records, out, load_records(out), load_goal(out), plan_records(out))
@@ -259,7 +281,9 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
 
     pool = prompt_pool(json.loads((args.run_dir / "data.json").read_text()))
-    session = LoadSession(run, ctx, pool, slo, args.probe_seconds, env, args.server_timeout, free_mib)
+    session = LoadSession(
+        run, ctx, pool, slo, args.probe_seconds, _hub_offline(env, ctx), args.server_timeout, free_mib
+    )
     if args.config:
         session.baseline()
         for r in targets(run.records, args.config):
