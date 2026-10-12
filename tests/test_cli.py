@@ -4,12 +4,16 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 
 import pytest
 
-from vllm_dyno import cli
+from vllm_dyno import cli, planner, probe
 from vllm_dyno.cli import main
-from vllm_dyno.runner import HARNESS_SHA
+from vllm_dyno.fit import FitProposer
+from vllm_dyno.planner import AllProposer, LlmProposer
+from vllm_dyno.runner import HARNESS_SHA, Run
+from vllm_dyno.search import Goal
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
@@ -82,13 +86,31 @@ def test_load_takes_the_planner_key_out_of_the_environment_before_starting_anyth
     assert "OPENROUTER_API_KEY" not in os.environ
 
 
-def test_every_planner_but_the_rules_gets_a_server_budget_and_all_gets_none_unless_given(tmp_path):
-    for planner in ("fit", "all"):
-        with pytest.raises(SystemExit, match="is not a run directory"):
-            main(["load", str(tmp_path / "missing"), "--planner", planner])
-    assert cli._max_servers("llm", None) == cli._max_servers("fit", None) == 10
-    assert cli._max_servers("all", None) == sys.maxsize
-    assert (cli._max_servers("all", 3), cli._max_servers("llm", 3)) == (3, 3)
+@pytest.mark.parametrize(
+    ("argv", "kind", "name", "budget"),
+    [
+        (["--planner", "llm", "--planner-url", "http://localhost:8000/v1"], LlmProposer, "org/model", 10),
+        (["--planner", "fit"], FitProposer, "fit", 10),
+        (["--planner", "fit", "--max-servers", "3"], FitProposer, "fit", 3),
+        (["--planner", "all"], AllProposer, "all", sys.maxsize),
+        (["--planner", "all", "--max-servers", "3"], AllProposer, "all", 3),
+    ],
+)
+def test_load_hands_the_planning_loop_the_planner_it_names_and_its_server_budget(
+    tmp_path, monkeypatch, ctx, argv, kind, name, budget
+):
+    meta = {"created": "2026-10-12 10:00", "context": ctx.to_json(), "goal": asdict(Goal()), "harness_sha": HARNESS_SHA}
+    Run(tmp_path).write_meta(meta | {"env": cli._trial_env(meta)})
+    (tmp_path / "data.json").write_text(json.dumps({"speed_prompts": []}))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)  # fit and all need none
+    monkeypatch.setattr(probe, "query_gpu", lambda: ctx.gpu)
+    monkeypatch.setattr(cli, "_hub_offline", lambda env, ctx: env)
+    monkeypatch.setattr(cli, "_setup_logging", lambda logfile: None)
+    calls = []
+    monkeypatch.setattr(planner, "plan", lambda session, proposer, goal, target, **kw: calls.append((proposer, kw)))
+    main(["load", str(tmp_path), "--planner-model", "org/model", *argv])
+    [(proposer, kw)] = calls
+    assert (type(proposer), proposer.name, kw["max_servers"]) == (kind, name, budget)
 
 
 @pytest.mark.parametrize("value", [None, ""])
