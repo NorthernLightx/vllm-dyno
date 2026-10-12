@@ -42,13 +42,13 @@ from unittest import mock
 from . import load, planner, search
 from .load import LoadSession, Slo, gains, load_records, session_baseline
 from .planner import Llm, Proposal
-from .report import _table, load_recommendation, quality
+from .report import load_recommendation, markdown_table, quality
 from .runner import Run, trial_key
 from .search import Goal, candidate_of
 from .space import DEFAULTS, KNOBS, Candidate, Context
 
 if TYPE_CHECKING:
-    from .planner import Proposer, Step  # ty: ignore[unresolved-import]
+    from .planner import Proposer, Step
 
 log = logging.getLogger(__name__)
 
@@ -486,13 +486,13 @@ def proposer(name: str, seed: int, llm: Llm | None) -> Proposer:
     if name == "llm":
         if llm is None:
             raise ValueError("the llm planner needs an endpoint")
-        return planner.LlmProposer(llm)  # ty: ignore[unresolved-attribute]
+        return planner.LlmProposer(llm)
     if name == "fit":
-        from .fit import FitProposer  # ty: ignore[unresolved-import]
+        from .fit import FitProposer
 
         return FitProposer(seed)
     if name == "all":
-        return planner.AllProposer()  # ty: ignore[unresolved-attribute]
+        return planner.AllProposer()
     if name == "random":
         return RandomProposer(seed)
     if name == "optuna":
@@ -646,7 +646,7 @@ def markdown(result: dict) -> str:
         _num(s["regret_mean"], ".3f"),
         _num(s["regret_worst"], ".3f"),
     ]
-    lines += _table([*header, "regret mean", "regret worst"], [row])
+    lines += markdown_table([*header, "regret mean", "regret worst"], [row])
     if s["tokens"]:
         prompt, completion = (s["tokens"][k] for k in planner.TOKENS)
         lines += ["", f"The endpoint counted {prompt:,} prompt and {completion:,} completion tokens in all repeats."]
@@ -673,5 +673,5 @@ def markdown(result: dict) -> str:
         ]
         for c in sorted(t["configs"], key=lambda c: -c["chat"] if result["goal"] == "chat" else -c["batch"])
     ]
-    lines += _table(["config", "same engine as", "load records", "engine records", "chat", "batch", "KL"], rows)
+    lines += markdown_table(["config", "same engine as", "load records", "engine records", "chat", "batch", "KL"], rows)
     return "\n".join(lines) + "\n"

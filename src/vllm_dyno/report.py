@@ -69,7 +69,7 @@ def _cost(r: dict, gpu_price: float | None) -> str:
     return f"{gpu_price / (r['tput_tok_s'] * 3600) * 1e6:.3f}"
 
 
-def _table(header: list[str], rows: list[list[str]]) -> list[str]:
+def markdown_table(header: list[str], rows: list[list[str]]) -> list[str]:
     return [
         "| " + " | ".join(header) + " |",
         "|" + "---|" * len(header),
@@ -285,7 +285,7 @@ def _plan_lines(picks: Sequence[dict]) -> list[str]:
         for i, p in enumerate(picks, 1)
     ]
     header = ["#", "config", *(["expected chat, batch"] if expects else []), "measured", "hypothesis"]
-    lines += _table(header, rows)
+    lines += markdown_table(header, rows)
     counted = [p["tokens"] for p in picks if p.get("tokens")]
     if counted:
         prompt, completion = (sum(t[k] for t in counted) for k in TOKENS)
@@ -369,7 +369,7 @@ def render(
             ]
             for r in sorted(confirm, key=goal.score, reverse=True)
         ]
-        lines += _table(header, rows)
+        lines += markdown_table(header, rows)
 
     if load:
         slo = load[0]["slo"]
@@ -423,7 +423,7 @@ def render(
             "KV tokens",
             "KL",
         ]
-        lines += _table(header, rows)
+        lines += markdown_table(header, rows)
 
     if picks:
         lines += _plan_lines(picks)
@@ -453,7 +453,7 @@ def render(
                     "ok" if goal.passes(r) else "; ".join(goal.violations(r)),
                 ]
             )
-        lines += _table(["setting", "tok/s", "TPOT", "KV tokens", "KL", "verdict"], rows)
+        lines += markdown_table(["setting", "tok/s", "TPOT", "KV tokens", "KL", "verdict"], rows)
 
     front = set().union(
         *(pareto_keys([r for r in records if r["stage"] == s]) for s in ("screen", "combine", "confirm"))
@@ -496,7 +496,7 @@ def render(
         "load s",
         "Pareto",
     ]
-    lines += _table(header, rows)
+    lines += markdown_table(header, rows)
 
     failed = [r for r in records if r["status"] != "ok"]
     failed_under_load = [r for r in load if r["status"] != "ok"]

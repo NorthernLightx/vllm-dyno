@@ -5,7 +5,6 @@ import sys
 from dataclasses import asdict, replace
 
 import httpx
-import planner_contract
 import pytest
 
 from vllm_dyno import load, planner, replay, search
@@ -21,11 +20,6 @@ FP8_INT8 = "weights=fp8 kv_cache_dtype=int8_per_token_head"
 FP8_INT8_TRITON = "weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN"
 FP8_TRITON = "weights=fp8 attention_backend=TRITON_ATTN"
 INT8_TRITON = "kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN"
-
-
-@pytest.fixture(autouse=True)
-def proposer_interface(monkeypatch):
-    planner_contract.install(lambda obj, name, value: monkeypatch.setattr(obj, name, value, raising=False))
 
 
 def cand(label: str) -> Candidate:
