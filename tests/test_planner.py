@@ -191,19 +191,43 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
     assert journal[1]["result"] == "KL 0.0600 offline, over the limit; no server started"
     assert journal[3]["tokens"] == {"prompt_tokens": 200, "completion_tokens": 20}  # the refused stop counts
     first = json.loads(sent[0].content)["messages"][1]["content"]
-    assert "Settings no loaded config has changed yet: weights, kv_cache_dtype, attention_backend." in first
+    assert "Settings whose effect under load is not known yet: weights, kv_cache_dtype, attention_backend." in first
     refused = json.loads(sent[4].content)["messages"]
     assert refused[-1]["content"].startswith(
-        "stopping is allowed once each setting has been loaded; not yet: kv_cache_dtype."
+        "stopping is allowed once each setting's effect under load is known; not yet: kv_cache_dtype."
     )
     last = json.loads(sent[-1].content)["messages"][1]["content"]
     assert "attention_backend=TRITON_ATTN | 1.20x, 1.00x | chat 12.00 req/s" in last
     assert "Servers left: 7 of 10, about 7 minutes each." in last
-    assert "Settings no loaded config has changed yet" not in last
+    assert "Settings whose effect under load is not known yet" not in last
     allowed_now = last.split("Allowed configs, not loaded yet:\n")[1].split("\n\n")[0].splitlines()
     assert "weights=fp8 kv_cache_dtype=int8_per_token_head" not in allowed_now
     assert "weights=fp8 attention_backend=TRITON_ATTN" not in allowed_now
     assert len(list((tmp_path / "plan").iterdir())) == 5
+
+
+def test_a_setting_is_known_once_two_configs_that_served_differ_in_it_alone(tmp_path, monkeypatch, ctx):
+    replies = [
+        pick("weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN"),
+        pick(None),  # refused: the three settings changed at once
+        pick("weights=fp8 kv_cache_dtype=int8_per_token_head"),
+        pick(None),  # refused: only the attention backend is known
+        pick("weights=fp8"),
+        pick(None),
+    ]
+    s, llm, measured, sent = setup(tmp_path, monkeypatch, ctx, replies)
+    plan(s, llm, Goal(), "chat", max_servers=10, max_combos=8, trial_timeout_s=900)
+    assert measured == [
+        "baseline",
+        "weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN",
+        "weights=fp8 kv_cache_dtype=int8_per_token_head",
+        "weights=fp8",
+    ]
+    refusals = [json.loads(sent[i].content)["messages"][-1]["content"] for i in (2, 4)]
+    assert [r.split(". Answer")[0].split("not yet: ")[1] for r in refusals] == [
+        "weights, kv_cache_dtype, attention_backend",
+        "weights, kv_cache_dtype",
+    ]
 
 
 def test_the_planner_stops_at_its_server_budget(tmp_path, monkeypatch, ctx):
@@ -234,7 +258,7 @@ def test_the_rules_finish_the_session_when_the_model_names_no_allowed_config_twi
     assert "answered twice with no allowed config or stop" in step["error"]
 
 
-def test_a_stop_counts_once_every_setting_has_been_loaded():
+def test_a_stop_counts_only_once_no_setting_is_left_untried():
     options = [cand("weights=fp8")]
     with pytest.raises(ValueError, match="not yet: weights, speculative"):
         parse('{"config": null, "hypothesis": "h"}', options, ["weights", "speculative"])

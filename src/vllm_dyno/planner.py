@@ -6,8 +6,10 @@ within the quality limit on its own. It answers with one config and the gains it
 to stop. A combination is checked offline for quality first, as the rules do, and only a config within
 the limit starts a server, so the budget counts servers.
 
-A stop counts only once every setting the model may change has been loaded at least once: offline speed
-can misjudge a setting under load, and a model that judges by it stops before loading that setting.
+A stop counts only once the effect under load of every setting the model may change is known: offline
+speed can misjudge a setting under load, and a model that judges by it stops before loading that setting.
+An effect is known once two configs that served, or one and the baseline, differ in that setting alone;
+a config that changes several untried settings at once shows none of their effects.
 
 If the endpoint fails, or answers twice with something outside the list, the rules finish the session,
 reusing every config already loaded.
@@ -148,7 +150,9 @@ def parse(reply: str, options: list[Candidate], untried: Sequence[str] = ()) -> 
     hypothesis = str(d.get("hypothesis") or "")
     if d.get("config") is None:
         if untried:
-            raise ValueError(f"stopping is allowed once each setting has been loaded; not yet: {', '.join(untried)}")
+            raise ValueError(
+                f"stopping is allowed once each setting's effect under load is known; not yet: {', '.join(untried)}"
+            )
         return Proposal(None, hypothesis)
     by_key = {_key(c.label()): c for c in options}
     cand = by_key.get(_key(str(d["config"])))
@@ -278,9 +282,10 @@ def brief(
         lines += [
             "",
             (
-                f"Settings no loaded config has changed yet: {', '.join(untried)}. Offline results can mislead under "
-                "load, so you may stop only once each setting has been loaded at least once; one config may change "
-                "several."
+                f"Settings whose effect under load is not known yet: {', '.join(untried)}. A setting's effect is "
+                "known once two loaded configs, or a loaded config and the baseline, differ in that setting alone. "
+                "Offline results can mislead under load, so you may stop only once the effect of each setting is "
+                "known."
             ),
         ]
     lines += ["", f"Servers left: {servers_left} of {max_servers}{each}."]
@@ -319,9 +324,10 @@ def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Can
 
 
 def untried(session: LoadSession, options: list[Candidate]) -> list[str]:
-    """Settings that a remaining config changes and no config loaded so far did."""
-    tried = {k for r in load_records(session.run.path) for k in candidate_of(r).changes()}
-    return [k for k in KNOBS if k not in tried and any(k in c.changes() for c in options)]
+    """Settings that a remaining config changes and that no two configs that served differ in alone."""
+    served = {candidate_of(r) for r in load_records(session.run.path) if r["status"] == "ok"}
+    known = {k for c in served for k in c.changes() if c.replace(**{k: DEFAULTS[k]}) in served}
+    return [k for k in KNOBS if k not in known and any(k in c.changes() for c in options)]
 
 
 def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Goal) -> tuple[str, bool]:
