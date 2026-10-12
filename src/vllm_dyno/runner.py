@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 HARNESS_SHA = hashlib.sha256(Path(harness.__file__).read_bytes()).hexdigest()[:12]
 
+# also searched in the whole log, so none may match a line every start logs ("Available KV cache memory: <n> GiB")
 OOM_PATTERNS = (
     "out of memory",
     "outofmemoryerror",
@@ -44,8 +45,8 @@ def classify(log_text: str) -> tuple[str, str]:
     """Status and a one-line error for a trial process that exited without metrics.
 
     Only exception lines decide "unsupported": a successful engine logs plenty of
-    "not supported" warnings too. OOM patterns are searched in the whole log as well,
-    so none may match a line every start logs, such as "Available KV cache memory: 1.34 GiB".
+    "not supported" warnings too. OOM patterns count anywhere in the log: an OOM that
+    aborts the process from C++ leaves no exception line.
     """
     errors = [f"{name}: {msg.strip()}" for name, msg in ERROR_LINE.findall(log_text)]
     causes = [e for e in errors if not any(w in e.lower() for w in WRAPPERS)] or errors
