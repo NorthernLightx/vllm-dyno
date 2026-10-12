@@ -229,10 +229,6 @@ def _tokens(picks: list[dict]) -> dict[str, int] | None:
     return {k: sum(t.get(k, 0) for t in counted) for k in planner.TOKENS} if counted else None
 
 
-def _strip(record: dict) -> dict:
-    return {k: v for k, v in copy.deepcopy(record).items() if k not in ("session", "dir")}
-
-
 def _measure_config(rec: Recorded, rng: random.Random, base: dict) -> Callable[..., dict]:
     def measure_config(
         r: dict,
@@ -247,12 +243,12 @@ def _measure_config(rec: Recorded, rng: random.Random, base: dict) -> Callable[.
     ) -> dict:
         cand = candidate_of(r)
         if cand == Candidate():
-            return _strip(base)
+            return copy.deepcopy(base)
         reps = rec.replicates(cand)
         if not reps:
             raise ReplayGap(r["label"], "load")
         rep = rng.choice(reps)
-        out = _strip(rep.record) | {
+        out = copy.deepcopy(rep.record) | {
             "label": r["label"],
             **asdict(cand),
             "capacity_rps": rep.chat * base["capacity_rps"],
