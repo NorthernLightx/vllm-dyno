@@ -14,7 +14,7 @@ from pathlib import Path
 log = logging.getLogger("vllm_dyno")
 
 IGNORE_FILES = ["*.bin", "*.pth", "*.pt", "*.gguf", "*.onnx", "*.msgpack", "*.h5", "original/*"]
-MAX_SERVERS = 10  # the default budget of a planner that picks configs one at a time
+MAX_SERVERS = 10  # the default server budget of the llm and fit planners; the all planner has none
 
 
 def _unwind_on_signals() -> None:
