@@ -1,7 +1,8 @@
 import json
+import logging
 import re
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import httpx
 import planner_contract
@@ -19,6 +20,7 @@ from vllm_dyno.space import Candidate
 FP8_INT8 = "weights=fp8 kv_cache_dtype=int8_per_token_head"
 FP8_INT8_TRITON = "weights=fp8 kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN"
 FP8_TRITON = "weights=fp8 attention_backend=TRITON_ATTN"
+INT8_TRITON = "kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN"
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +57,7 @@ OFFLINE = [  # what `dyno run` wrote
     trial("confirm", "baseline", 0.0005),
 ]
 COMBINE_KL = {
-    "kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN": 0.014,
+    INT8_TRITON: 0.014,
     FP8_INT8: 0.02,
     FP8_TRITON: 0.0075,
     FP8_INT8_TRITON: 0.021,
@@ -123,11 +125,20 @@ def record_session(monkeypatch, path, ctx, sid: str, how, results=SERVED) -> Non
         how(LoadSession(Run(path), ctx, [[1]], Slo(), 30, {}, 600, 6000, id=sid))
 
 
-def rules_run(tmp_path, monkeypatch, ctx, max_combos: int = 8, offline=OFFLINE):
+def rules_run(tmp_path, monkeypatch, ctx, max_combos: int = 8, offline=OFFLINE, results=SERVED):
     path = tmp_path / "rules"
     write_run(path, ctx, offline)
-    record_session(monkeypatch, path, ctx, "s1", lambda s: s.search(Goal(), max_combos, 900))
+    record_session(monkeypatch, path, ctx, "s1", lambda s: s.search(Goal(), max_combos, 900), results)
     return path
+
+
+def write_load(path, records: list[dict]) -> None:
+    (path / "load.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+def failed(stage: str, label: str) -> dict:
+    """An offline trial vLLM refused to run."""
+    return trial(stage, label, 0.0, status="unsupported") | {"kl": None}
 
 
 def test_a_rules_replay_loads_what_the_recorded_session_loaded_and_recommends_the_same(tmp_path, monkeypatch, ctx):
@@ -154,12 +165,14 @@ def test_a_rules_replay_loads_what_the_recorded_session_loaded_and_recommends_th
 
 
 def loading(label: str):
-    """A session that loads the baseline and then label, after its quality trial if it combines settings."""
+    """A session that loads the baseline, then the combination label if its quality trial ran."""
 
     def drive(session: LoadSession, seed: int) -> None:
         session.baseline()
         searcher = Searcher(session.run, session.ctx, Goal(), {}, 900)
-        session.measure(searcher.stage("combine", [cand(label)], SCREEN)[0])
+        r = searcher.stage("combine", [cand(label)], SCREEN)[0]
+        if r["status"] == "ok":
+            session.measure(r)
 
     return drive
 
@@ -304,13 +317,35 @@ def test_servers_and_trials_are_answered_from_the_records_only_while_a_repeat_ru
     assert all(fake is not original for fake, original in zip(during[0], real))
     replay.repeat(rec, best, loading(FP8_TRITON), 1, 0, "chat")
     assert (load.measure_config, load.wait_for_gpu, search.run_trial) == real
+    rules = LoadSession.search
+    monkeypatch.setattr(replay, "proposer", lambda name, seed, llm: Scripted([RuntimeError("planner crashed")]))
+    drive = replay.driver("scripted", Goal(), "chat", max_servers=3, max_combos=8, llm=None)
+    with pytest.raises(RuntimeError, match="planner crashed"):
+        replay.repeat(rec, best, drive, 2, 0, "chat")
+    assert (load.measure_config, load.wait_for_gpu, search.run_trial, LoadSession.search) == (*real, rules)
 
 
-def test_runs_measured_with_other_load_code_are_not_pooled(tmp_path, ctx):
+SLO_100 = asdict(Slo(tpot_ms=100))
+ENV = {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+@pytest.mark.parametrize(
+    ("model", "harness_sha", "load_json", "named"),
+    [
+        ("org/other", "abc", {}, "model org/base against org/other"),
+        ("org/base", "def", {}, "offline harness abc against def"),
+        ("org/base", "abc", {"load_sha": "000000000000"}, f"load code {load.LOAD_SHA} against 000000000000"),
+        ("org/base", "abc", {"slo": SLO_100}, f"SLO {asdict(Slo())} against {SLO_100}"),
+        ("org/base", "abc", {"probe_s": 60}, "probe window 30 against 60"),
+        ("org/base", "abc", {"env": ENV}, f"environment {{}} against {ENV}"),
+    ],
+    ids=["model", "offline harness", "load code", "SLO", "probe window", "environment"],
+)
+def test_runs_measured_another_way_are_not_pooled(tmp_path, ctx, model, harness_sha, load_json, named):
     ours, theirs = tmp_path / "ours", tmp_path / "theirs"
     write_run(ours, ctx)
-    write_run(theirs, ctx, load_sha="000000000000")
-    expected = f"{ours} and {theirs} were measured differently (load code {load.LOAD_SHA} against 000000000000)"
+    write_run(theirs, replace(ctx, model=model), harness_sha=harness_sha, **load_json)
+    expected = f"{ours} and {theirs} were measured differently ({named})"
     with pytest.raises(SystemExit, match=re.escape(expected)):
         replay.recorded([ours, theirs])
 
@@ -326,6 +361,106 @@ def test_runs_whose_load_json_has_no_environment_pool_only_with_each_other(tmp_p
     expected = f"{old} and {new} were measured differently (environment None against {{}})"
     with pytest.raises(SystemExit, match=re.escape(expected)):
         replay.recorded([old, new])
+
+
+def test_a_run_whose_load_records_name_other_load_code_than_its_load_json_is_refused(tmp_path, ctx):
+    path = tmp_path / "run"
+    write_run(path, ctx)
+    write_load(path, [served("baseline", 10.0, 1000.0, "FLASH_ATTN") | {"session": "a", "load_sha": "000000000000"}])
+    expected = f"{path}/load.jsonl holds records of other load code than its load.json: ['000000000000']"
+    with pytest.raises(SystemExit, match=re.escape(expected)):
+        replay.recorded([path])
+
+
+def test_only_ok_load_records_against_a_baseline_that_served_are_drawn(tmp_path, ctx):
+    path = tmp_path / "run"
+    write_run(path, ctx)
+    awq = "weights=org/base-AWQ"  # measured, though no offline trial here allows it
+    write_load(
+        path,
+        [
+            served("baseline", 4.0, 400.0, "FLASH_ATTN") | {"session": "a", "status": "degraded"},
+            served("baseline", 10.0, 1000.0, "FLASH_ATTN") | {"session": "a"},
+            served("weights=fp8", 12.0, 1200.0, "FLASH_ATTN") | {"session": "a"},
+            served(awq, 11.0, 1500.0, "FLASH_ATTN") | {"session": "a"},
+            served("kv_cache_dtype=int8_per_token_head", 0.0, 0.0, "TRITON_ATTN")
+            | {"session": "a", "status": "failed"},
+            served("baseline", 0.0, 900.0, "FLASH_ATTN") | {"session": "b", "capacity_rps": None},
+            served("weights=fp8", 9.0, 1100.0, "FLASH_ATTN") | {"session": "b"},
+        ],
+    )
+    rec = replay.recorded([path])
+    assert [(b["session"], b["capacity_rps"]) for b in rec.baselines] == [("a", 10.0)]
+    assert {c.label(): [(r.chat, r.batch) for r in reps] for c, reps in rec.measured.items()} == {
+        "weights=fp8": [(pytest.approx(1.2), pytest.approx(1.2))],
+        awq: [(pytest.approx(1.1), pytest.approx(1.5))],
+    }
+    assert [r["label"] for r in replay.truth(rec, "chat").table] == ["baseline", "weights=fp8", awq]
+
+
+def test_a_session_starts_from_the_trials_dyno_run_wrote_up_to_its_confirm_stage(tmp_path, monkeypatch, ctx):
+    offline = [*OFFLINE, trial("confirm", "weights=fp8", 0.009, tput=2100.0)]
+    path = rules_run(tmp_path, monkeypatch, ctx, offline=offline)
+    assert {r["stage"] for r in Run(path).records[len(offline) :]} == {"combine"}  # the rules session's
+    rec = replay.recorded([path])
+    started = []
+
+    def drive(session: LoadSession, seed: int) -> None:
+        started.append(Run(session.run.path).records)
+        session.baseline()
+
+    replay.repeat(rec, replay.truth(rec, "chat"), drive, 0, 0, "chat")
+    assert started == [offline]
+    result = replay.replay([path], "rules", repeats=1, max_servers=10, max_combos=8, seed=0, target="chat")
+    assert {c["config"]: c["kl"] for c in result["truth"]["configs"]}["weights=fp8"] == 0.009
+
+
+def test_a_combination_that_failed_offline_fails_again_unless_another_run_ran_it(tmp_path, monkeypatch, ctx):
+    refused = tmp_path / "refused"
+    write_run(refused, ctx, [*OFFLINE, failed("combine", FP8_TRITON)])  # after confirm, as dyno load appends it
+    record_session(monkeypatch, refused, ctx, "s1", lambda s: s.search(Goal(), 8, 900))
+    assert FP8_TRITON not in [r["label"] for r in load_records(refused)]
+    ran = tmp_path / "ran"
+    write_run(ran, ctx)
+    record_session(monkeypatch, ran, ctx, "s2", lambda s: loading(FP8_TRITON)(s, 0))
+    last_trials = []
+
+    def drive(session: LoadSession, seed: int) -> None:
+        loading(FP8_TRITON)(session, seed)
+        last_trials.append(Run(session.run.path).records[-1])
+
+    both = replay.recorded([refused, ran])
+    outcome = replay.repeat(both, replay.truth(both, "chat"), drive, 0, 0, "chat")
+    assert (outcome["gap"], outcome["loaded"]) == (None, ["baseline", FP8_TRITON])
+    assert (last_trials[-1]["label"], last_trials[-1]["status"]) == (FP8_TRITON, "ok")
+    alone = replay.recorded([refused])
+    outcome = replay.repeat(alone, replay.truth(alone, "chat"), drive, 0, 0, "chat")
+    assert (outcome["gap"], outcome["loaded"]) == (None, ["baseline"])
+    assert (last_trials[-1]["label"], last_trials[-1]["status"]) == (FP8_TRITON, "unsupported")
+
+
+@pytest.fixture
+def cli_logging():
+    """Restores the logger levels cmd_replay sets for the rest of the process."""
+    loggers = [logging.getLogger(name) for name in ("vllm_dyno", "vllm_dyno.replay")]
+    levels = [lg.level for lg in loggers]
+    yield
+    for lg, level in zip(loggers, levels):
+        lg.setLevel(level)
+
+
+def test_a_batch_replay_scores_the_batch_figure(tmp_path, monkeypatch, ctx, capsys, cli_logging):
+    path = rules_run(tmp_path, monkeypatch, ctx, results={**SERVED, FP8_TRITON: (12.5, 1600.0, "TRITON_ATTN")})
+    main(["replay", str(path), "--repeats", "1", "--goal", "batch"])
+    text = capsys.readouterr().out
+    assert "| rules |  | 1 | 0 | 0 | 5.0 | 40 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
+    assert f"Truth: `{FP8_TRITON}`; tied with it: none." in text
+    configs = [line.split(" | ")[0] for line in text.splitlines() if line.startswith("| `")]
+    assert configs[0] == f"| `{FP8_TRITON}`" and configs[-1] == "| `attention_backend=TRITON_ATTN`"
+    monkeypatch.setattr(replay, "proposer", lambda name, seed, llm: Scripted([FP8_INT8]))
+    for target, regret in (("batch", 1.6 / 1.4), ("chat", 1.0)):
+        result = replay.replay([path], "scripted", repeats=1, max_servers=1, max_combos=8, seed=0, target=target)
+        assert (result["repeats"][0]["pick"], result["summary"]["regret_worst"]) == (FP8_INT8, pytest.approx(regret))
 
 
 def test_optuna_loads_the_configs_best_offline_first_then_what_tpe_asks_for(tmp_path, monkeypatch, ctx):
@@ -348,6 +483,32 @@ def test_the_optuna_planner_names_the_extra_it_needs(monkeypatch):
     monkeypatch.setitem(sys.modules, "optuna", None)
     with pytest.raises(SystemExit, match="install the bench extra"):
         replay.OptunaProposer(0)
+
+
+def test_optuna_scores_failed_combinations_infeasible_and_a_same_engine_skip_as_its_twin(tmp_path, monkeypatch, ctx):
+    # combinations `dyno run` ran before its confirm stage: one over the KL limit, one vLLM refused
+    offline = [*OFFLINE[:-1], trial("combine", FP8_TRITON, 0.09), failed("combine", INT8_TRITON), OFFLINE[-1]]
+    path = rules_run(tmp_path, monkeypatch, ctx, offline=offline)
+    told = []
+
+    class Telling(Scripted):
+        def propose(self, step):
+            told.append(replay._known(step))
+            return super().propose(step)
+
+    monkeypatch.setattr(replay, "proposer", lambda name, seed, llm: Telling([FP8_INT8, FP8_INT8_TRITON]))
+    result = replay.replay([path], "scripted", repeats=1, max_servers=2, max_combos=8, seed=0, target="chat")
+    assert result["repeats"][0]["plan"][1]["result"].startswith(f"runs the same engine as {FP8_INT8}")
+    third = {c.label(): (pytest.approx(score), feasible) for c, (score, feasible) in told[2].items()}
+    twins = (replay._score(1.4, 1.4, "chat"), True)
+    assert third == {
+        "baseline": (0.0, True),
+        FP8_INT8: twins,
+        FP8_INT8_TRITON: twins,
+        FP8_TRITON: (replay.INFEASIBLE, False),
+        INT8_TRITON: (replay.INFEASIBLE, False),
+    }
+    assert replay._offline_estimate(offline)(cand(FP8_INT8)) == pytest.approx(2.0 * 1.4)
 
 
 def test_random_loads_any_config_left_until_its_budget_is_spent(tmp_path, monkeypatch, ctx):
@@ -378,7 +539,7 @@ def test_an_llm_replay_asks_the_endpoint_at_every_step_and_counts_its_tokens(tmp
     assert "The endpoint counted 400 prompt and 40 completion tokens in all repeats." in replay.markdown(result)
 
 
-def test_replay_prints_a_summary_and_writes_every_repeat(tmp_path, monkeypatch, ctx, capsys):
+def test_replay_prints_a_summary_and_writes_every_repeat(tmp_path, monkeypatch, ctx, capsys, cli_logging):
     path = rules_run(tmp_path, monkeypatch, ctx)
     out = tmp_path / "replay.json"
     main(["replay", str(path), "--repeats", "2", "--out", str(out)])
