@@ -2,7 +2,7 @@ from dataclasses import asdict
 
 import pytest
 
-from vllm_dyno.report import load_recommendation, pareto_keys, recommendation, render
+from vllm_dyno.report import load_recommendation, load_winner, pareto_keys, recommendation, render
 from vllm_dyno.search import Goal
 from vllm_dyno.space import Candidate
 
@@ -158,6 +158,14 @@ def test_load_recommendation_breaks_ties_on_the_other_profile_then_quality(ctx, 
     assert "weights=fp8 kv_cache_dtype=int8_per_token_head" in tied
     assert "weights=org/base-GPTQ-3bit attention_backend=TRITON_ATTN" not in tied
     assert ("attention_backend=TRITON_ATTN" in tied) == (target == "chat")
+
+
+def test_the_load_winner_breaks_a_tie_in_kl_on_the_higher_gain_on_the_target():
+    scores = {"a": (1.30, 1.10, 0.01), "b": (1.35, 1.02, 0.01), "c": (1.40, 0.70, 0.0)}
+    # c leads on chat, and trails on batch by more than the margin
+    assert load_winner(scores, "chat") == ("b", ["a", "c"])
+    assert load_winner(scores, "batch") == ("a", ["b"])
+    assert load_winner(scores | {"d": (1.33, 1.05, 0.001)}, "chat") == ("d", ["a", "b", "c"])
 
 
 def test_report_recommends_the_load_pick_and_keeps_the_offline_one_below(ctx, tmp_path):

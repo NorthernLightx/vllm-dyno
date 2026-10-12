@@ -80,6 +80,40 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
 _LOAD_TARGETS = {"chat": "highest chat capacity under the SLO", "batch": "highest batch throughput"}
 
 
+def load_scores(
+    load: Sequence[dict], records: list[dict], goal: Goal
+) -> dict[str, tuple[dict, tuple[float, float, float]]]:
+    """Per label, the load record load_recommendation weighs, with its offline KL, and its chat gain, batch gain and KL.
+
+    A label's last record that has both gains counts. Only configs within the KL limit do.
+    """
+    scored: dict[str, tuple[dict, tuple[float, float, float]]] = {}
+    for r in load:
+        q = quality(records, r["label"])
+        chat, batch = gains(r, session_baseline(list(load), r))
+        if q is None or q["kl"] > goal.max_kl or chat is None or batch is None:
+            continue
+        scored[r["label"]] = (r | {"kl": q["kl"]}, (chat, batch, q["kl"]))
+    return scored
+
+
+def load_winner(scores: dict[str, tuple[float, float, float]], target: str) -> tuple[str, list[str]]:
+    """The label to serve for `target` given each label's chat gain, batch gain and KL, and the labels tied with it.
+
+    Labels within LOAD_MIN_GAIN of the best on the target are tied with it. Among them the other profile
+    decides the same way, and then the lowest KL, and then the higher gain on the target.
+    """
+    first = 0 if target == "chat" else 1
+
+    def tied(labels: list[str], i: int) -> list[str]:
+        top = max(scores[k][i] for k in labels)
+        return [k for k in labels if scores[k][i] * (1 + LOAD_MIN_GAIN) >= top]
+
+    on_target = tied(list(scores), first)
+    best = min(tied(on_target, 1 - first), key=lambda k: (scores[k][2], -scores[k][first]))
+    return best, [k for k in on_target if k != best]
+
+
 def load_recommendation(
     load: Sequence[dict], records: list[dict], goal: Goal, target: str
 ) -> tuple[dict, list[dict]] | None:
@@ -88,24 +122,11 @@ def load_recommendation(
     Configs within LOAD_MIN_GAIN of the best on the target are tied with it. Among them the other profile
     decides the same way, and then the lowest KL. Only configs within the KL limit count.
     """
-    scored: dict[str, tuple[dict, tuple[float, float]]] = {}
-    for r in load:
-        q = quality(records, r["label"])
-        chat, batch = gains(r, session_baseline(list(load), r))
-        if q is None or q["kl"] > goal.max_kl or chat is None or batch is None:
-            continue
-        scored[r["label"]] = (r | {"kl": q["kl"]}, (chat, batch))
+    scored = load_scores(load, records, goal)
     if not scored:
         return None
-    first = 0 if target == "chat" else 1
-
-    def tied(items: list[tuple[dict, tuple[float, float]]], i: int) -> list[tuple[dict, tuple[float, float]]]:
-        top = max(s[i] for _, s in items)
-        return [(r, s) for r, s in items if s[i] * (1 + LOAD_MIN_GAIN) >= top]
-
-    on_target = tied(list(scored.values()), first)
-    best = min(tied(on_target, 1 - first), key=lambda t: (t[0]["kl"], -t[1][first]))[0]
-    return best, [r for r, _ in on_target if r["label"] != best["label"]]
+    best, ties = load_winner({label: s for label, (_, s) in scored.items()}, target)
+    return scored[best][0], [scored[label][0] for label in ties]
 
 
 def quality(records: list[dict], label: str) -> dict | None:
