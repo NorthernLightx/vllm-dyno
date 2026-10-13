@@ -429,6 +429,32 @@ def test_search_loads_settings_within_quality_then_combines_those_that_gained(tm
     ]
 
 
+def test_the_rules_combine_only_feasible_configs_up_to_max_combos(tmp_path, monkeypatch, ctx):
+    run = Run(tmp_path)
+    for label in ("baseline", "weights=fp8", "kv_cache_dtype=turboquant_k8v4", "attention_backend=TRITON_ATTN"):
+        run.append(trial("screen", label, 0.001))
+    results = {"weights=fp8": (11, 1100), "kv_cache_dtype=turboquant_k8v4": (15, 1500)}
+    results["attention_backend=TRITON_ATTN"] = (14, 1000)
+    staged = []
+
+    class FakeSearcher:
+        def __init__(self, *args):
+            pass
+
+        def stage(self, stage, cands, tier):
+            staged.extend(c.label() for c in cands)
+            return [trial(stage, c.label(), 0.001) for c in cands]
+
+    monkeypatch.setattr(
+        load, "measure_config", lambda r, *a, **k: loaded(r["label"], "", *results.get(r["label"], (10, 1000)))
+    )
+    monkeypatch.setattr(load, "wait_for_gpu", lambda free_mib: None)
+    monkeypatch.setattr(load, "Searcher", FakeSearcher)
+    LoadSession(run, ctx, [[1]], Slo(), 30, {}, 600, 6000, id="s").search(Goal(), max_combos=1, trial_timeout_s=900)
+    # turboquant with TRITON_ATTN would gain the most, but vLLM runs turboquant only on its own backend
+    assert staged == ["weights=fp8 kv_cache_dtype=turboquant_k8v4"]
+
+
 def measure(
     tmp_path,
     monkeypatch,

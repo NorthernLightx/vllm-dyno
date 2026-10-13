@@ -66,7 +66,7 @@ import httpx
 
 from .runner import Run, classify, kill_group, slug, wait_for_gpu
 from .search import SCREEN, Goal, Searcher, candidate_of, combinations
-from .space import KNOBS, Context, engine_args, serve_command
+from .space import KNOBS, Context, engine_args, infeasible_reason, serve_command
 
 log = logging.getLogger(__name__)
 
@@ -743,7 +743,8 @@ class LoadSession:
                 self.measure(r)
         good = promising_under_load(load_records(self.run.path), LOAD_MIN_GAIN)
         # pairs first, so a triple whose explicit backend changes nothing is seen to match a pair already loaded
-        combos = sorted(combinations(good, limit=sys.maxsize), key=lambda c: len(c.changes()))[:max_combos]
+        feasible = [c for c in combinations(good, limit=sys.maxsize) if infeasible_reason(c, self.ctx) is None]
+        combos = sorted(feasible, key=lambda c: len(c.changes()))[:max_combos]
         if not combos:
             log.info("load     fewer than two settings gained %.0f%%; nothing to combine", LOAD_MIN_GAIN * 100)
             return
