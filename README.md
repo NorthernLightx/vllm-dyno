@@ -2,7 +2,7 @@
 
 vllm-dyno finds a vLLM serving config for your GPU and model. It measures how far each candidate config's output drifts from the unmodified model, then serves candidates within your quality limit through `vllm serve` under concurrent load and recommends the one that handled the most traffic. Serving every candidate takes hours, so by default vllm-dyno fits a model of what each setting does under load and serves only the configs that model says could still win.
 
-Status: v0.3, tested on one machine (RTX 3070 8 GB, WSL2, vLLM 0.31) with Qwen2.5-1.5B-Instruct and Qwen3-1.7B.
+Status: v0.3, tested on one machine (RTX 3070 8 GB, WSL2, vLLM 0.31) with Qwen2.5-1.5B-Instruct, Qwen3-1.7B and SmolLM2-1.7B-Instruct.
 
 ```
 uv run dyno run Qwen/Qwen2.5-1.5B-Instruct --out runs/qwen2.5-1.5b
@@ -115,38 +115,47 @@ No planner may stop before the effect of every setting it can change is known: t
 
 #### How the planners compare
 
-To compare planners on the same footing, `--planner all` served every allowed config of both models; that set of measurements is the ground truth. `dyno replay` then runs a planner many times against those records instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. A replayed session recommends by the same rule as a real one, and is scored by whether its pick matches the recommendation over every config's mean gains, or falls among the configs tied with it (within 10% on both profiles). GPU minutes add the servers' and the offline trials' wall time.
+To compare planners on the same footing, `--planner all` served every allowed config of each model; those measurements are the ground truth. `dyno replay` then runs a planner many times against the recorded measurements instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. A replayed session recommends by the same rule as a real one, and is scored by whether its pick matches the recommendation over every config's mean gains, or falls among the configs tied with it (within 10% on both profiles). GPU minutes add the servers' and the offline trials' wall time.
 
 Over 100 replayed sessions per planner, with chat as the goal:
 
-| Qwen2.5-1.5B-Instruct (the full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
+| Qwen2.5-1.5B-Instruct (3 sessions, 2 of them a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
 |---|---|---|---|---|
 | rules | 10.0 | 81 | 1.00 | 1.00 |
-| fit | 6.1 | 53 | 1.00 | 1.00 |
-| fit, 5 servers | 5.0 | 45 | 0.98 | 1.00 |
-| Optuna TPE, 10 servers | 10.0 | 88 | 0.98 | 1.00 |
-| Optuna TPE, 5 servers | 5.0 | 45 | 0.59 | 1.00 |
-| random, 10 servers | 10.0 | 89 | 0.37 | 1.00 |
-| random, 5 servers | 5.0 | 48 | 0.16 | 0.92 |
+| fit | 6.4 | 56 | 1.00 | 1.00 |
+| fit, 5 servers | 5.0 | 45 | 0.99 | 1.00 |
+| Optuna TPE, 10 servers | 10.0 | 88 | 0.96 | 1.00 |
+| Optuna TPE, 5 servers | 5.0 | 45 | 0.55 | 1.00 |
+| random, 10 servers | 10.0 | 90 | 0.39 | 1.00 |
+| random, 5 servers | 5.0 | 48 | 0.16 | 0.90 |
 
-| Qwen3-1.7B (8 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
+| Qwen3-1.7B (9 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
 |---|---|---|---|---|
-| rules | 13.2 | 106 | 0.03 | 0.94 |
-| fit | 8.7 | 81 | 0.34 | 0.95 |
-| fit, 5 servers | 5.0 | 49 | 0.13 | 0.80 |
-| Optuna TPE, 10 servers | 10.0 | 98 | 0.15 | 0.99 |
-| Optuna TPE, 5 servers | 5.0 | 52 | 0.09 | 0.99 |
-| random, 10 servers | 10.0 | 98 | 0.12 | 0.90 |
-| random, 5 servers | 5.0 | 52 | 0.06 | 0.74 |
+| rules | 13.3 | 106 | 0.07 | 0.92 |
+| fit | 8.4 | 78 | 0.23 | 0.95 |
+| fit, 5 servers | 5.0 | 49 | 0.16 | 0.81 |
+| Optuna TPE, 10 servers | 10.0 | 96 | 0.06 | 1.00 |
+| Optuna TPE, 5 servers | 5.0 | 51 | 0.03 | 0.99 |
+| random, 10 servers | 10.0 | 98 | 0.06 | 0.89 |
+| random, 5 servers | 5.0 | 52 | 0.03 | 0.72 |
 
-Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are tied with the truth there, and which of them a session ends on decides the "same pick" column. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules.
+| SmolLM2-1.7B-Instruct (5 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
+|---|---|---|---|---|
+| rules | 6.3 | 53 | 0.34 | 1.00 |
+| fit | 4.0 | 36 | 1.00 | 1.00 |
+| Optuna TPE, 10 servers | 8.6 | 71 | 1.00 | 1.00 |
+| Optuna TPE, 5 servers | 5.0 | 44 | 0.50 | 1.00 |
+| random, 10 servers | 8.0 | 66 | 1.00 | 1.00 |
+| random, 5 servers | 5.0 | 44 | 0.53 | 0.99 |
 
-Real sessions, each on a copy of the same offline run, measured by the same load code:
+Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are tied with the truth there, and which of them a session ends on decides the "same pick" column. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules. SmolLM2-1.7B-Instruct has no quantized checkpoints from its publisher and could not run ngram, which leaves nine allowed configs, seven of them distinct engines; the fit planner found the truth's config there with four servers in every session.
+
+Real sessions; within each model they ran on copies of the same offline run and under the same load code:
 
 | model | planner | servers | minutes | recommended | chat | batch | KL |
 |---|---|---|---|---|---|---|---|
 | Qwen2.5-1.5B | fit | 7 | 58 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.22x | 0.0008 |
-| Qwen2.5-1.5B | all | 20 | 207 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.23x | 0.0008 |
+| Qwen2.5-1.5B | all | 20 | 209 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.23x | 0.0008 |
 | Qwen3-1.7B | fit | 8 | 68 | GPTQ-Int8 + int8 KV cache | 1.68x | 1.49x | 0.0292 |
 | Qwen3-1.7B | rules | 13 | 110 | GPTQ-Int8 + int8 KV cache | 1.61x | 1.50x | 0.0292 |
 | Qwen3-1.7B | rules | 13 | 97 | GPTQ-Int8 + int8 KV cache | 1.68x | 1.50x | 0.0292 |
@@ -155,8 +164,13 @@ Real sessions, each on a copy of the same offline run, measured by the same load
 | Qwen3-1.7B | Claude Opus 5.5 | 6 | 63 | fp8 + TRITON_ATTN | 1.48x | 1.37x | 0.0111 |
 | Qwen3-1.7B | Claude Opus 5.5 | 6 | 62 | GPTQ-Int8 + int8 KV cache + TRITON_ATTN | 1.68x | 1.48x | 0.0270 |
 | Qwen3-1.7B | all | 27 | 270 | GPTQ-Int8 + int8 KV cache | 1.61x | 1.51x | 0.0292 |
+| SmolLM2-1.7B | fit | 4 | 42 | fp8 + TRITON_ATTN | 1.83x | 1.70x | 0.0095 |
+| SmolLM2-1.7B | rules | 6 | 55 | fp8 + turboquant KV cache | 1.76x | 1.71x | 0.0100 |
+| SmolLM2-1.7B | Nemotron 3 Super | 5 | 46 | fp8 + turboquant KV cache | 1.83x | 1.75x | 0.0100 |
+| SmolLM2-1.7B | Claude Opus 5.5 | 3 | 29 | fp8 + TRITON_ATTN | 1.76x | 1.70x | 0.0095 |
+| SmolLM2-1.7B | all | 7 | 59 | fp8 + TRITON_ATTN | 1.76x | 1.70x | 0.0095 |
 
-Servers do not count the baseline; minutes are wall time. Chat and batch are multiples of each session's own baseline, so one bisection step of the baseline moves a ratio by 4 to 9%. The Qwen2.5 sweep ran in two sessions; its minutes leave out the pause between them.
+Servers do not count the baseline; minutes are wall time. Chat and batch are multiples of each session's own baseline, so one bisection step of the baseline moves a ratio by 4 to 9%. The Qwen2.5 sweep ran in two sessions; its minutes leave out the pause between them. In the SmolLM2 sweep, fp8 weights with TRITON_ATTN, with the turboquant KV cache or with the int8 KV cache served the same chat capacity, 12.34 req/s, and batch throughput within 6% of each other, at KLs of 0.0095 to 0.0106: the measurements do not separate them, and different sessions recommended different ones.
 
 The LLM planner sends the model the GPU and model, the SLO, every offline trial, every config served so far with its gains, its own earlier picks next to what they measured, and the configs it may pick. It answers with a config, the gains it expects and why, or with a stop. If the endpoint fails, or the model twice names a config outside the list, the rules finish the session and reuse every config already served. By default the endpoint is Nemotron 3 Super on OpenRouter's free tier, with the API key in `OPENROUTER_API_KEY`:
 
@@ -197,7 +211,7 @@ uv run dyno replay runs/<sweep> runs/<other session> --planner fit --repeats 100
 - Chat capacity comes in bisection steps of 4 to 9%, and each config is served once per session, so configs within 10% of each other count as a tie.
 - `max_num_seqs` and `max_num_batched_tokens` stay at vLLM's serving defaults, 256 and 2,048 on GPUs under 70 GiB. Raising them did not help on the RTX 3070. With the GPTQ-Int8 checkpoint and int8 KV cache, the batch profile used 38% of the cache, and `--max-num-seqs 512` lowered batch throughput from 2,850 to 2,513 tok/s. With GPTQ-Int8 and TRITON_ATTN, `--max-num-batched-tokens 4096` left batch throughput level and raised TPOT p90 at 21.67 req/s from 51 to 54 ms.
 - KL is computed over the baseline's top 20 tokens and reads slightly low.
-- The planners were compared on two models on one GPU. The fit planner's starting weights and noise were not tuned on other models, and the LLM planner's endpoint samples with its own defaults, so two of its sessions can pick differently.
+- The planners were compared on three models on one GPU. The fit planner's starting weights and noise were not tuned on other models, and the LLM planner's endpoint samples with its own defaults, so two of its sessions can pick differently.
 - The LLM planner sends the GPU and model names and the measurements to its endpoint; check the provider's data policy. Free models on OpenRouter are rate limited.
 - One GPU, no tensor parallelism.
 - Tested only on an RTX 3070 with vLLM 0.31.

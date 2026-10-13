@@ -31,7 +31,7 @@ This starts `vllm serve` once per config and measures chat capacity, the highest
 
 `--planner` decides which configs get a server:
 
-- Leave the default, `fit`. It serves one config at a time, each the likeliest to be recommended under a fitted model of what every setting does under load, and stops once no config left is likely to change the recommendation. With Qwen2.5-1.5B-Instruct and Qwen3-1.7B it served 7 and 8 configs and recommended what serving every config did.
+- Leave the default, `fit`. It serves one config at a time, each the likeliest to be recommended under a fitted model of what every setting does under load, and stops once no config left is likely to change the recommendation. With Qwen2.5-1.5B-Instruct, Qwen3-1.7B and SmolLM2-1.7B-Instruct it served 7, 8 and 4 configs and recommended what serving every config did.
 - `--planner rules` serves every setting on its own, then combinations of those that gained. It needs no model and serves more configs: 13 against 8 for Qwen3-1.7B.
 - `--planner llm` asks a language model. It needs an API key and sends the GPU, the model and the measurements to the provider, so ask the person first.
 - `--planner all` serves every allowed config. For Qwen3-1.7B that was 27 servers in four and a half hours. Use it only when the person wants the whole space measured.
