@@ -430,11 +430,13 @@ def measure(
     label: str = "weights=fp8",
     compiles: int = 0,
     starts: list | None = None,
+    dies_at: float | None = None,
 ) -> dict:
     """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran.
 
     Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline. The first
     `compiles` starts compile the model's graph and get a smaller KV cache; each start is appended to `starts`.
+    A server given `dies_at` logs a CUDA error and stops answering when probed at that rate.
     """
     batched, lone_params, warmup_sizes = [], [], []
     starts = [] if starts is None else starts
@@ -456,6 +458,10 @@ def measure(
         return Sent([Timing(0.05, lone / 1000, max_tokens)] * len(prompts), 1.0, 0.0)
 
     def fake_probe(url, model, pool, rate, slo, probe_s):
+        if dies_at is not None and rate >= dies_at:
+            with (tmp_path / "server.log").open("a") as f:
+                f.write("(EngineCore pid=7) RuntimeError: CUDA error: an illegal memory access was encountered\n")
+            raise httpx.ConnectError("[Errno 111] Connection refused")
         n, tpot = 60, after if batched else 8.9
         met = n if rate <= 20 else 0
         return {
@@ -507,6 +513,18 @@ def test_a_server_slower_after_batch_than_at_its_first_probe_is_degraded(
     # a degraded record keeps its numbers for diagnosis
     assert record["capacity_rps"] == pytest.approx(20, rel=load.PRECISION)
     assert (record["batch"]["tput_tok_s"], record["kv_tokens"], record["lone_tpot_ms"]) == (2900, 44624, 8.5)
+
+
+def test_a_server_that_stops_answering_once_it_served_is_recorded_with_the_cause_its_log_gives(
+    tmp_path, monkeypatch, ctx
+):
+    record = measure(tmp_path, monkeypatch, ctx, 8.9, dies_at=8.0)
+    assert record["status"] == "crash"
+    assert record["error"] == (
+        "the server stopped answering (ConnectError: [Errno 111] Connection refused); its log ends with "
+        "RuntimeError: CUDA error: an illegal memory access was encountered"
+    )
+    assert record["wall_s"] >= 0 and "capacity_rps" not in record
 
 
 @pytest.mark.parametrize(("compiles", "kv_tokens", "started"), [(0, 44624, 1), (1, 44624, 2), (2, 28000, 2)])

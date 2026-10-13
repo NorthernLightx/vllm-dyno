@@ -605,6 +605,11 @@ def measure_config(
             )
     except ServerFailed as e:
         return record | {"status": e.status, "error": e.error, "wall_s": round(time.monotonic() - started, 1)}
+    except (httpx.HTTPError, json.JSONDecodeError) as e:
+        # the server answered /health, then stopped answering; its log may say why
+        status, cause = classify(log_path.read_text(errors="replace"))
+        error = f"the server stopped answering ({type(e).__name__}: {e}); its log ends with {cause}"
+        return record | {"status": status, "error": error, "wall_s": round(time.monotonic() - started, 1)}
     at_capacity = next((p for p in reversed(probes) if p["rate"] == lo), None)  # lo may have failed once
     return record | {
         "status": "degraded" if slowed else "ok",
