@@ -181,7 +181,9 @@ def warm_wall_s(run_dir: Path, r: dict) -> float | None:
     """r's wall time without its server's first start, where that start compiled the model's graph.
 
     load.serving_from_cache keeps the log of such a start as server-compile.log, next to the log of the
-    start that served; the time between their first lines is what the first start took.
+    start that served; the time between their first lines is what the first start took. A span outside the
+    record's own wall time comes from a server-compile.log an interrupted session left behind, or from a
+    clock that jumped, and leaves the wall time as recorded.
     """
     out = run_dir / r.get("dir", "")
     first, served = out / "server-compile.log", out / "server.log"
@@ -190,7 +192,8 @@ def warm_wall_s(run_dir: Path, r: dict) -> float | None:
     began, again = _first_time(first), _first_time(served)
     if began is None or again is None:
         return r["wall_s"]
-    return max(r["wall_s"] - (again - began).total_seconds(), 0.0)
+    span = (again - began).total_seconds()
+    return r["wall_s"] - span if 0 <= span < r["wall_s"] else r["wall_s"]
 
 
 def recorded(dirs: Sequence[Path]) -> Recorded:

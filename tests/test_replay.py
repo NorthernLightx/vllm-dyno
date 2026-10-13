@@ -529,6 +529,11 @@ def test_a_server_is_charged_without_a_first_start_that_compiled_the_model(tmp_p
     rec = replay.recorded([path])
     assert rec.baselines[0]["wall_s"] == 400.0  # no first start kept, so none compiled
     assert [r.record["wall_s"] for r in rec.measured[cand("weights=fp8")]] == [400.0 - 100.0]
+    # a server-compile.log an interrupted session left behind, and a clock that went back, change nothing
+    for compiled, served_at in (("10-12 08:00:00", "10-12 23:00:00"), ("10-12 23:59:30", "10-12 23:58:00")):
+        (out / "server-compile.log").write_text(line.replace("10-12 {}", compiled) + f"{load.COMPILED_LINE}\n")
+        (out / "server.log").write_text(line.replace("10-12 {}", served_at))
+        assert replay.warm_wall_s(path, {"dir": "load/001-weights-fp8", "wall_s": 400.0}) == 400.0
 
 
 def test_a_session_starts_from_the_trials_dyno_run_wrote_up_to_its_confirm_stage(tmp_path, monkeypatch, ctx):
