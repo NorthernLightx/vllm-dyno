@@ -1,6 +1,12 @@
+import dataclasses
+import json
+from pathlib import Path
+
 import pytest
 
-from vllm_dyno.runner import Run, classify, skip
+from vllm_dyno import runner
+from vllm_dyno.runner import Run, classify, run_trial, skip
+from vllm_dyno.search import SCREEN
 from vllm_dyno.space import Candidate
 
 WRAPPED = """\
@@ -82,3 +88,27 @@ def test_run_records_survive_a_restart_and_skips_are_recorded_once(tmp_path):
     reloaded = Run(tmp_path)
     assert reloaded.records == [first]
     assert (reloaded.find("screen|kv_cache_dtype=fp8") or {}).get("status") == "skipped"
+
+
+def test_a_trial_waits_for_the_gpu_memory_free_before_it_started(tmp_path, monkeypatch, ctx):
+    run = Run(tmp_path)
+    run.write_meta({"free_mib_at_start": 7000})  # the desktop has taken more since
+
+    class Finished:
+        pid = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        spec = json.loads(Path(cmd[-1]).read_text())
+        Path(spec["out"]).write_text(json.dumps({"tput_tok_s": 1000.0}))
+        return Finished()
+
+    waits: list[int] = []
+    monkeypatch.setattr(runner, "query_gpu", lambda: dataclasses.replace(ctx.gpu, free_mib=5200))
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "kill_group", lambda proc: None)
+    monkeypatch.setattr(runner, "wait_for_gpu", waits.append)
+    r = run_trial(run, ctx, "screen", Candidate(), SCREEN, write_reference=False, env={}, timeout_s=60)
+    assert (r["status"], r["tput_tok_s"], waits) == ("ok", 1000.0, [5200])

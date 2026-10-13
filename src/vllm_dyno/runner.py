@@ -100,7 +100,7 @@ def kill_group(proc: subprocess.Popen) -> None:
 
 
 def wait_for_gpu(free_mib: int, slack_mib: int = 400, timeout_s: float = 60) -> None:
-    """Block until GPU memory is back near the level measured before the run."""
+    """Block until GPU memory is back near free_mib, the level measured before the trial or server."""
     deadline = time.monotonic() + timeout_s
     while (now := query_gpu().free_mib) < free_mib - slack_mib:
         if time.monotonic() > deadline:
@@ -148,6 +148,8 @@ def run_trial(
     }
     (trial_dir / "spec.json").write_text(json.dumps(spec, indent=2))
 
+    # what the desktop holds changes over a run, so the level to come back to is measured now
+    free_before = query_gpu().free_mib
     started = time.monotonic()
     status, error, metrics = "ok", None, {}
     with (trial_dir / "engine.log").open("w") as out:
@@ -182,5 +184,5 @@ def run_trial(
         "dir": str(trial_dir.relative_to(run.path)),
     }
     run.append(record)
-    wait_for_gpu(run.meta["free_mib_at_start"])
+    wait_for_gpu(free_before)
     return record
