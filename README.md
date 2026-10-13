@@ -30,7 +30,7 @@ uv run dyno load runs/qwen2.5-1.5b
 `dyno run` took 15 minutes to measure quality and speed in vLLM's offline engine, where fp8 weights were the fastest config within the default KL limit of 0.05. `dyno load` then measured the baseline under load and served seven of the 29 configs the offline run allowed, one at a time, in 58 minutes. Four of its five combination trials came from earlier sessions on the same offline run; a fresh run would take about 4 minutes more.
 
 | config | attention | expected chat | chat req/s | batch tok/s | KL |
-|---|---|---|---|---|---|
+|---|---|---:|---:|---:|---:|
 | baseline (bf16) | FLASH_ATTN | | 17.45 | 2,356 | 0 |
 | TRITON_ATTN attention backend | TRITON_ATTN | 1.00x | 21.67 (1.24x) | 2,623 | 0.0007 |
 | GPTQ-Int8 + TRITON_ATTN (recommended) | TRITON_ATTN | 1.27x | 20.75 (1.19x) | 2,883 | 0.0008 |
@@ -117,43 +117,37 @@ No planner may stop before the effect of every setting it can change is known: t
 
 To compare planners on the same footing, `--planner all` served every allowed config of each model. `dyno replay` then runs a planner many times against the recorded measurements of every session of that model instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. The truth is what the recommendation rule picks over each config's mean gains across those sessions. A replayed session recommends by the same rule as a real one, and is scored by whether its pick is the truth's config, or one within 10% of the best config's chat capacity (the profile the goal names). GPU minutes add the servers' and the offline trials' wall time.
 
-Over 100 replayed sessions per planner, with chat as the goal:
+Replay draws on every recorded session of each model: three for Qwen2.5-1.5B-Instruct, two of which together make up its full sweep; nine for Qwen3-1.7B and five for SmolLM2-1.7B-Instruct, each including one full sweep. Over 100 replayed sessions per planner, with chat as the goal:
 
-| Qwen2.5-1.5B-Instruct (3 sessions, 2 of them a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
-|---|---|---|---|---|
-| rules | 10.0 | 81 | 1.00 | 1.00 |
-| fit | 6.3 | 55 | 1.00 | 1.00 |
-| fit, 5 servers | 5.0 | 45 | 0.99 | 1.00 |
-| Optuna TPE, 10 servers | 10.0 | 88 | 0.96 | 1.00 |
-| Optuna TPE, 5 servers | 5.0 | 45 | 0.55 | 1.00 |
-| random, 10 servers | 10.0 | 90 | 0.39 | 1.00 |
-| random, 5 servers | 5.0 | 48 | 0.16 | 0.90 |
-
-| Qwen3-1.7B (9 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
-|---|---|---|---|---|
-| rules | 13.3 | 106 | 0.07 | 0.92 |
-| fit | 8.4 | 78 | 0.24 | 0.94 |
-| fit, 5 servers | 5.0 | 49 | 0.16 | 0.81 |
-| Optuna TPE, 10 servers | 10.0 | 96 | 0.06 | 1.00 |
-| Optuna TPE, 5 servers | 5.0 | 51 | 0.03 | 0.99 |
-| random, 10 servers | 10.0 | 98 | 0.06 | 0.89 |
-| random, 5 servers | 5.0 | 52 | 0.03 | 0.72 |
-
-| SmolLM2-1.7B-Instruct (5 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
-|---|---|---|---|---|
-| rules | 6.3 | 53 | 0.34 | 1.00 |
-| fit | 4.0 | 36 | 1.00 | 1.00 |
-| Optuna TPE, 10 servers | 8.6 | 71 | 1.00 | 1.00 |
-| Optuna TPE, 5 servers | 5.0 | 44 | 0.50 | 1.00 |
-| random, 10 servers | 8.0 | 66 | 1.00 | 1.00 |
-| random, 5 servers | 5.0 | 44 | 0.53 | 0.99 |
+| model | planner | servers | GPU minutes | same pick as the truth | tied with the truth |
+|---|---|---:|---:|---:|---:|
+| Qwen2.5-1.5B | rules | 10.0 | 81 | 1.00 | 1.00 |
+| Qwen2.5-1.5B | fit | 6.3 | 55 | 1.00 | 1.00 |
+| Qwen2.5-1.5B | fit, 5 servers | 5.0 | 45 | 0.99 | 1.00 |
+| Qwen2.5-1.5B | Optuna TPE, 10 servers | 10.0 | 88 | 0.96 | 1.00 |
+| Qwen2.5-1.5B | Optuna TPE, 5 servers | 5.0 | 45 | 0.55 | 1.00 |
+| Qwen2.5-1.5B | random, 10 servers | 10.0 | 90 | 0.39 | 1.00 |
+| Qwen2.5-1.5B | random, 5 servers | 5.0 | 48 | 0.16 | 0.90 |
+| Qwen3-1.7B | rules | 13.3 | 106 | 0.07 | 0.92 |
+| Qwen3-1.7B | fit | 8.4 | 78 | 0.24 | 0.94 |
+| Qwen3-1.7B | fit, 5 servers | 5.0 | 49 | 0.16 | 0.81 |
+| Qwen3-1.7B | Optuna TPE, 10 servers | 10.0 | 96 | 0.06 | 1.00 |
+| Qwen3-1.7B | Optuna TPE, 5 servers | 5.0 | 51 | 0.03 | 0.99 |
+| Qwen3-1.7B | random, 10 servers | 10.0 | 98 | 0.06 | 0.89 |
+| Qwen3-1.7B | random, 5 servers | 5.0 | 52 | 0.03 | 0.72 |
+| SmolLM2-1.7B | rules | 6.3 | 53 | 0.34 | 1.00 |
+| SmolLM2-1.7B | fit | 4.0 | 36 | 1.00 | 1.00 |
+| SmolLM2-1.7B | Optuna TPE, 10 servers | 8.6 | 71 | 1.00 | 1.00 |
+| SmolLM2-1.7B | Optuna TPE, 5 servers | 5.0 | 44 | 0.50 | 1.00 |
+| SmolLM2-1.7B | random, 10 servers | 8.0 | 66 | 1.00 | 1.00 |
+| SmolLM2-1.7B | random, 5 servers | 5.0 | 44 | 0.53 | 0.99 |
 
 Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are within 10% of the best there, and which of them a session ends on decides the "same pick" column: the sweep session alone recommended GPTQ-Int8 with the int8 KV cache, while over the means of all nine sessions the rule picks fp8 weights with TRITON_ATTN. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules. SmolLM2-1.7B-Instruct has no quantized checkpoints from its publisher and could not run ngram, which leaves nine allowed configs, seven of them distinct engines; the fit planner found the truth's config there with four servers in every session.
 
 Real sessions; within each model they ran on copies of the same offline run and under the same load code:
 
 | model | planner | servers | minutes | recommended | chat | batch | KL |
-|---|---|---|---|---|---|---|---|
+|---|---|---:|---:|---|---:|---:|---:|
 | Qwen2.5-1.5B | fit | 7 | 58 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.22x | 0.0008 |
 | Qwen2.5-1.5B | all | 20 | 209 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.23x | 0.0008 |
 | Qwen3-1.7B | fit | 8 | 68 | GPTQ-Int8 + int8 KV cache | 1.68x | 1.49x | 0.0292 |
