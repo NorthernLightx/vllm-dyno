@@ -25,14 +25,16 @@ together with the configs it counts as tied. Each repeat is scored by the config
 recommend: whether that runs the truth's engine (exact) or the engine of a tied config (tied), and
 the truth's mean gain on the target profile over the pick's (regret).
 
-Only records measured the same way are pooled: one model, offline harness, load code, SLO, probe
-window and environment.
+Only records measured the same way are pooled: one model and its checkpoints at their revisions,
+one GPU, memory budget, sequence length and vLLM version, one offline reference, offline harness,
+load code, SLO, probe window and environment.
 """
 
 from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -144,10 +146,22 @@ def offline_run(records: list[dict]) -> list[dict]:
     return records[: last + 1] if last is not None else [r for r in records if r["stage"] == "screen"]
 
 
-def _measured_by(meta: dict, settings: dict) -> dict:
-    """What has to match for two runs' load records to be comparable."""
+def _digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.exists() else None
+
+
+def _measured_by(d: Path, meta: dict, settings: dict) -> dict:
+    """What has to match for the load records and offline trials of two runs to be comparable."""
+    ctx = meta["context"]
     return {
-        "model": meta["context"]["model"],
+        "model": ctx["model"],
+        "model revision": ctx.get("revision"),
+        "checkpoints": [f"{c['repo']}@{c.get('revision')}" for c in ctx.get("checkpoints", [])],
+        "GPU": ctx["gpu"]["name"],
+        "memory utilization": ctx["util"],
+        "max model len": ctx["max_model_len"],
+        "vLLM": ctx["host"].get("vllm"),
+        "offline reference": _digest(d / "reference.npz"),  # KL is measured against it
         "offline harness": meta["harness_sha"],
         "load code": settings["load_sha"],
         "SLO": settings["slo"],
@@ -187,9 +201,9 @@ def recorded(dirs: Sequence[Path]) -> Recorded:
             raise SystemExit(f"{d} holds no run measured under load")
         metas.append(Run(d).meta)
         settings.append(json.loads((d / "load.json").read_text()))
-    first = _measured_by(metas[0], settings[0])
+    first = _measured_by(dirs[0], metas[0], settings[0])
     for d, m, s in zip(dirs, metas, settings):
-        theirs = _measured_by(m, s)
+        theirs = _measured_by(d, m, s)
         if differ := [k for k in first if theirs[k] != first[k]]:
             values = "; ".join(f"{k} {first[k]} against {theirs[k]}" for k in differ)
             raise SystemExit(

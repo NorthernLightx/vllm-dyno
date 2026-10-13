@@ -373,6 +373,40 @@ def test_runs_measured_another_way_are_not_pooled(tmp_path, ctx, model, harness_
         replay.recorded([ours, theirs])
 
 
+@pytest.mark.parametrize(
+    ("change", "named"),
+    [
+        ({"util": 0.7}, "memory utilization 0.63 against 0.7"),
+        ({"max_model_len": 4096}, "max model len 2048 against 4096"),
+        ({"revision": "abc123"}, "model revision None against abc123"),
+        ({"checkpoints": ()}, "checkpoints ['org/base-AWQ@None', 'org/base-GPTQ-3bit@None'] against []"),
+        ({"host": {"vllm": "0.32.0", "nvcc": False, "wsl": True}}, "vLLM 0.31.0 against 0.32.0"),
+    ],
+    ids=["memory utilization", "max model len", "model revision", "checkpoints", "vLLM"],
+)
+def test_runs_of_another_machine_budget_or_checkpoint_are_not_pooled(tmp_path, ctx, change, named):
+    ours, theirs = tmp_path / "ours", tmp_path / "theirs"
+    write_run(ours, ctx)
+    write_run(theirs, replace(ctx, **change))
+    with pytest.raises(SystemExit, match=re.escape(f"were measured differently ({named})")):
+        replay.recorded([ours, theirs])
+
+
+def test_runs_of_another_gpu_or_offline_reference_are_not_pooled(tmp_path, ctx):
+    ours, gpu, reference = tmp_path / "ours", tmp_path / "gpu", tmp_path / "reference"
+    write_run(ours, ctx)
+    write_run(gpu, replace(ctx, gpu=replace(ctx.gpu, name="NVIDIA GeForce RTX 4090")))
+    with pytest.raises(SystemExit, match=re.escape("(GPU NVIDIA GeForce RTX 3070 against NVIDIA GeForce RTX 4090)")):
+        replay.recorded([ours, gpu])
+    write_run(reference, ctx)
+    (ours / "reference.npz").write_bytes(b"ours")
+    (reference / "reference.npz").write_bytes(b"theirs")
+    with pytest.raises(
+        SystemExit, match="measured differently \\(offline reference [0-9a-f]{12} against [0-9a-f]{12}\\)"
+    ):
+        replay.recorded([ours, reference])
+
+
 def test_runs_whose_load_json_has_no_environment_pool_only_with_each_other(tmp_path, monkeypatch, ctx):
     old, older, new = tmp_path / "old", tmp_path / "older", tmp_path / "new"
     for path, env in ((old, None), (older, None), (new, {})):
