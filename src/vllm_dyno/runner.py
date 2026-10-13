@@ -99,7 +99,10 @@ def kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def wait_for_gpu(free_mib: int, slack_mib: int = 400, timeout_s: float = 60) -> None:
+SLACK_MIB = 400  # GPU memory a released process may still show as used for a while
+
+
+def wait_for_gpu(free_mib: int, slack_mib: int = SLACK_MIB, timeout_s: float = 60) -> None:
     """Block until GPU memory is back near free_mib, the level measured before the trial or server."""
     deadline = time.monotonic() + timeout_s
     while (now := query_gpu().free_mib) < free_mib - slack_mib:
@@ -150,6 +153,13 @@ def run_trial(
 
     # what the desktop holds changes over a run, so the level to come back to is measured now
     free_before = query_gpu().free_mib
+    if (at_start := run.meta.get("free_mib_at_start")) and free_before < at_start - SLACK_MIB:
+        log.warning(
+            "GPU memory before this trial: %d MiB free, %d less than when the run started; "
+            "another process or an earlier trial holds it",
+            free_before,
+            at_start - free_before,
+        )
     started = time.monotonic()
     status, error, metrics = "ok", None, {}
     with (trial_dir / "engine.log").open("w") as out:

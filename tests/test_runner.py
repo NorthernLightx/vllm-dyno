@@ -90,7 +90,7 @@ def test_run_records_survive_a_restart_and_skips_are_recorded_once(tmp_path):
     assert (reloaded.find("screen|kv_cache_dtype=fp8") or {}).get("status") == "skipped"
 
 
-def test_a_trial_waits_for_the_gpu_memory_free_before_it_started(tmp_path, monkeypatch, ctx):
+def test_a_trial_waits_for_the_gpu_memory_free_before_it_started(tmp_path, monkeypatch, ctx, caplog):
     run = Run(tmp_path)
     run.write_meta({"free_mib_at_start": 7000})  # the desktop has taken more since
 
@@ -112,3 +112,9 @@ def test_a_trial_waits_for_the_gpu_memory_free_before_it_started(tmp_path, monke
     monkeypatch.setattr(runner, "wait_for_gpu", waits.append)
     r = run_trial(run, ctx, "screen", Candidate(), SCREEN, write_reference=False, env={}, timeout_s=60)
     assert (r["status"], r["tput_tok_s"], waits) == ("ok", 1000.0, [5200])
+    # without waiting for it, the trial says that memory is held outside it
+    held = (
+        "GPU memory before this trial: 5200 MiB free, 1800 less than when the run started; "
+        "another process or an earlier trial holds it"
+    )
+    assert [m.getMessage() for m in caplog.records if m.levelname == "WARNING"] == [held]
