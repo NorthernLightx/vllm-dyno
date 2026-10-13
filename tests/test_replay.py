@@ -584,7 +584,7 @@ def cli_logging():
 
 def test_a_batch_replay_scores_the_batch_figure(tmp_path, monkeypatch, ctx, capsys, cli_logging):
     path = rules_run(tmp_path, monkeypatch, ctx, results={**SERVED, FP8_TRITON: (12.5, 1600.0, "TRITON_ATTN")})
-    main(["replay", str(path), "--repeats", "1", "--goal", "batch"])
+    main(["replay", str(path), "--planner", "rules", "--repeats", "1", "--goal", "batch"])
     text = capsys.readouterr().out
     assert "| rules |  | 1 | 0 | 0 | 5.0 | 44 | 4 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
     assert f"Truth: `{FP8_TRITON}`; tied with it: none." in text
@@ -675,7 +675,7 @@ def test_an_llm_replay_asks_the_endpoint_at_every_step_and_counts_its_tokens(tmp
 def test_replay_prints_a_summary_and_writes_every_repeat(tmp_path, monkeypatch, ctx, capsys, cli_logging):
     path = rules_run(tmp_path, monkeypatch, ctx)
     out = tmp_path / "replay.json"
-    main(["replay", str(path), "--repeats", "2", "--out", str(out)])
+    main(["replay", str(path), "--planner", "rules", "--repeats", "2", "--out", str(out)])
     text = capsys.readouterr().out
     assert "| rules |  | 2 | 0 | 0 | 5.0 | 44 | 4 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
     assert f"Truth: `{FP8_INT8}`; tied with it: `{FP8_INT8_TRITON}`." in text

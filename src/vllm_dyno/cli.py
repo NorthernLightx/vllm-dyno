@@ -466,11 +466,11 @@ def main(argv: list[str] | None = None) -> None:
     load.add_argument("--max-combos", type=int, default=8, help="combinations of gaining settings to load")
     load.add_argument(
         "--planner",
-        choices=["rules", "llm", "fit", "all"],
-        default="rules",
+        choices=["fit", "rules", "llm", "all"],
+        default="fit",
         help=(
+            "fit (default): the config likeliest to win under a fit of each setting's gain; "
             "rules: every setting, then combinations of those that gained; llm: a model picks each config; "
-            "fit: the config likeliest to win under a fit of each setting's gain; "
             "all: every allowed config, to measure the whole space"
         ),
     )
@@ -511,9 +511,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     replay.add_argument(
         "--planner",
-        choices=["rules", "llm", "fit", "all", "random", "optuna"],
-        default="rules",
-        help="rules: as dyno load; all: allowed configs in order, up to --max-servers; optuna needs the bench extra",
+        choices=["fit", "rules", "llm", "all", "random", "optuna"],
+        default="fit",
+        help="as dyno load; all: allowed configs in order, up to --max-servers; optuna needs the bench extra",
     )
     replay.add_argument("--repeats", type=int, default=100, help="sessions to replay")
     replay.add_argument(
