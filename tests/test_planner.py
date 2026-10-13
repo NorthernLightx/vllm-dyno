@@ -243,6 +243,7 @@ def test_the_planner_loads_its_picks_after_the_baseline_and_combinations_after_t
     assert journal[3]["tokens"] == {"prompt_tokens": 200, "completion_tokens": 20}  # the refused stop counts
     first = json.loads(sent[0].content)["messages"][1]["content"]
     assert "Settings whose effect under load is not known yet: weights, kv_cache_dtype, attention_backend." in first
+    assert "known once a config with it served, or failed to serve, where the same config without that setting" in first
     refused = json.loads(sent[4].content)["messages"]
     assert refused[-1]["content"].startswith(
         "stopping is allowed once each setting's effect under load is known; not yet: kv_cache_dtype."

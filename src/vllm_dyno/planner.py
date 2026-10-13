@@ -109,7 +109,7 @@ class Llm:
                 wait = 15.0 * attempt
                 try:
                     resp = c.post("/chat/completions", json=body)
-                except httpx.TransportError as e:
+                except (httpx.HTTPError, json.JSONDecodeError) as e:
                     problem = f"{type(e).__name__}: {e}"
                 else:
                     try:
@@ -321,9 +321,9 @@ def brief(
             "",
             (
                 f"Settings whose effect under load is not known yet: {', '.join(untried)}. A setting's effect is "
-                "known once two loaded configs, or a loaded config and the baseline, differ in that setting alone. "
-                "Offline results can mislead under load, so you may stop only once the effect of each setting is "
-                "known."
+                "known once a config with it served, or failed to serve, where the same config without that setting "
+                "served (or is the baseline). Offline results can mislead under load, so you may stop only once the "
+                "effect of each setting is known."
             ),
         ]
     lines += ["", f"Servers left: {servers_left} of {max_servers}{each}."]
@@ -446,7 +446,7 @@ def _measure(session: LoadSession, searcher: Searcher, cand: Candidate, goal: Go
         return f"runs the same engine as {same}; no server started", False
     try:
         rec = session.measure(r)
-    except (httpx.HTTPError, json.JSONDecodeError) as e:
+    except httpx.TransportError as e:
         # measure_config records a server that fails to start; one that dies once it answered raises out of it
         load.wait_for_gpu(session.free_mib)
         return f"the server stopped answering during measurement ({type(e).__name__}: {e}); no record", True
