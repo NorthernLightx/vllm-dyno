@@ -608,8 +608,9 @@ def measure_config(
             )
     except ServerFailed as e:
         return record | {"status": e.status, "error": e.error, "wall_s": round(time.monotonic() - started, 1)}
-    except (httpx.HTTPError, json.JSONDecodeError) as e:
-        # the server answered /health, then stopped answering; its log may say why
+    except httpx.TransportError as e:
+        # the server answered /health, then stopped answering; its log may say why. An error in dyno's own
+        # parsing of what a live server sent is not the server's and stops the session instead
         status, cause = classify(log_path.read_text(errors="replace"))
         error = f"the server stopped answering ({type(e).__name__}: {e}); its log ends with {cause}"
         return record | {"status": status, "error": error, "wall_s": round(time.monotonic() - started, 1)}

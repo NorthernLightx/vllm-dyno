@@ -465,12 +465,14 @@ def measure(
     compiles: int = 0,
     starts: list | None = None,
     dies_at: float | None = None,
+    dies_with: Exception | None = None,
 ) -> dict:
     """measure_config on a fake server that serves up to 20 req/s at TPOT p50 8.9 ms, and at `after` ms once batch ran.
 
     Requests sent one at a time decode at `lone` ms per token, and the engine did 8.0 offline. The first
     `compiles` starts compile the model's graph and get a smaller KV cache; each start is appended to `starts`.
-    A server given `dies_at` logs a CUDA error and stops answering when probed at that rate.
+    A server given `dies_at` logs a CUDA error and stops answering when probed at that rate; the probe then
+    raises `dies_with`, by default the error a refused connection gives.
     """
     batched, lone_params, warmup_sizes = [], [], []
     starts = [] if starts is None else starts
@@ -495,7 +497,7 @@ def measure(
         if dies_at is not None and rate >= dies_at:
             with (tmp_path / "server.log").open("a") as f:
                 f.write("(EngineCore pid=7) RuntimeError: CUDA error: an illegal memory access was encountered\n")
-            raise httpx.ConnectError("[Errno 111] Connection refused")
+            raise dies_with or httpx.ConnectError("[Errno 111] Connection refused")
         n, tpot = 60, after if batched else 8.9
         met = n if rate <= 20 else 0
         return {
@@ -559,6 +561,14 @@ def test_a_server_that_stops_answering_once_it_served_is_recorded_with_the_cause
         "RuntimeError: CUDA error: an illegal memory access was encountered"
     )
     assert record["wall_s"] >= 0 and "capacity_rps" not in record
+
+
+def test_an_error_in_reading_what_a_live_server_sent_stops_the_session_instead_of_becoming_a_record(
+    tmp_path, monkeypatch, ctx
+):
+    broken = json.JSONDecodeError("Unterminated string starting at", '{"text": "a', 9)
+    with pytest.raises(json.JSONDecodeError):
+        measure(tmp_path, monkeypatch, ctx, 8.9, dies_at=8.0, dies_with=broken)
 
 
 @pytest.mark.parametrize(

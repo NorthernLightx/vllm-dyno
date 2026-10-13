@@ -109,7 +109,7 @@ class Llm:
                 wait = 15.0 * attempt
                 try:
                     resp = c.post("/chat/completions", json=body)
-                except (httpx.HTTPError, json.JSONDecodeError) as e:
+                except httpx.TransportError as e:
                     problem = f"{type(e).__name__}: {e}"
                 else:
                     try:
