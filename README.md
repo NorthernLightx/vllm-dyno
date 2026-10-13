@@ -1,12 +1,12 @@
 # vllm-dyno
 
-vllm-dyno finds a vLLM serving config for your GPU and model. It measures how far each candidate config's output drifts from the unmodified model, serves the candidates within your quality limit through `vllm serve` under concurrent load, and recommends the one that handled the most traffic. A language model can choose which configs to serve, through any OpenAI-compatible endpoint.
+vllm-dyno finds a vLLM serving config for your GPU and model. It measures how far each candidate config's output drifts from the unmodified model, then serves candidates within your quality limit through `vllm serve` under concurrent load and recommends the one that handled the most traffic. Serving every candidate takes hours, so by default vllm-dyno fits a model of what each setting does under load and serves only the configs that model says could still win.
 
-Status: v0.2 in progress, tested on one machine (RTX 3070 8 GB, WSL2, vLLM 0.31).
+Status: v0.3, tested on one machine (RTX 3070 8 GB, WSL2, vLLM 0.31) with Qwen2.5-1.5B-Instruct and Qwen3-1.7B.
 
 ```
-uv run dyno run Qwen/Qwen2.5-1.5B-Instruct --out runs/qwen2.5-1.5b-1011c
-uv run dyno load runs/qwen2.5-1.5b-1011c
+uv run dyno run Qwen/Qwen2.5-1.5B-Instruct --out runs/qwen2.5-1.5b
+uv run dyno load runs/qwen2.5-1.5b
 ```
 
 ```
@@ -19,36 +19,32 @@ uv run dyno load runs/qwen2.5-1.5b-1011c
 10:19:15  confirm 4/4  attention_backend=TRITON_ATTN                           ok    2857 tok/s  TPOT  11.3 ms  TTFT    53 ms  KL 0.0007  top-1 0.982  (74 s)
 10:19:15  best     weights=fp8
 ...
-13:06:12  load     baseline                                                lone request: TPOT 11.8 ms, 11.7 ms offline
-13:10:16  load     baseline                                                chat  16.71 req/s: 100% within SLO, TTFT p90 216 ms, TPOT p90 47.4 ms, KV cache peak 42%, 0 preemptions
-13:11:06  load     baseline                                                batch 512 requests: 2308 tok/s, TPOT p50 83.1 ms, KV cache peak 100%, 72 preemptions
+11:04:37  load     baseline                                                batch 512 requests: 2356 tok/s, TPOT p50 82.3 ms, KV cache peak 100%, 72 preemptions
+11:05:15  plan     fit picks attention_backend=TRITON_ATTN, expecting chat 1.00x, batch 1.00x: Settles attention_backend against the baseline and wins 21% of 256 draws of the fitted gains: chat 1.00x (90% interval 0.66x to 1.51x), ...
+11:12:09  plan     attention_backend=TRITON_ATTN: chat 21.67 req/s (1.24x), batch 2623 tok/s (1.11x), KL 0.0006
+11:12:09  plan     fit picks weights=Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int8 attention_backend=TRITON_ATTN, expecting chat 1.27x, batch 1.14x: ...
 ...
-13:43:06  load     attention_backend=TRITON_ATTN                           chat  20.75 req/s: 100% within SLO, TTFT p90 204 ms, TPOT p90 42.2 ms, KV cache peak 48%, 0 preemptions
-...
-14:17:58  report   runs/qwen2.5-1.5b-1011c/report.md
+11:56:06  plan     fit stops: No config left, loaded next, would be recommended in 10% of 256 draws of the fitted gains; the likeliest, kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN, would in 2%.
 ```
 
-`dyno run` took 15 minutes to measure quality and speed in vLLM's offline engine, where fp8 weights were the fastest config within the default KL limit of 0.05. `dyno load` then served the configs through `vllm serve`, which took 73 minutes:
+`dyno run` took 15 minutes to measure quality and speed in vLLM's offline engine, where fp8 weights were the fastest config within the default KL limit of 0.05. `dyno load` then measured the baseline under load and served seven of the 29 configs the offline run allowed, one at a time, in 58 minutes:
 
-| config | attention | chat req/s | batch tok/s | KL |
-|---|---|---|---|---|
-| baseline (bf16) | FLASH_ATTN | 16.71 | 2,308 | 0 |
-| fp8 weights, quantized at load | FLASH_ATTN | 16.71 | 2,676 | 0.0076 |
-| Qwen2.5-1.5B-Instruct-GPTQ-Int8 | FLASH_ATTN | 16.71 | 2,623 | 0.0006 |
-| TRITON_ATTN attention backend | TRITON_ATTN | 20.75 | 2,561 | 0.0007 |
-| int8 KV cache (`int8_per_token_head`) | TRITON_ATTN | 20.75 | 2,836 | 0.0132 |
-| turboquant KV cache (`turboquant_k8v4`) | FLASH_ATTN+TURBOQUANT | 16.71 | 2,389 | 0.0006 |
-| ngram speculative decoding | FLASH_ATTN | 11.31 | 1,506 | 0 |
-| fp8 weights + TRITON_ATTN | TRITON_ATTN | 20.75 | 2,885 | 0.0069 |
-| fp8 weights + int8 KV cache | TRITON_ATTN | 20.75 | 2,876 | 0.0200 |
-| GPTQ-Int8 + TRITON_ATTN (recommended) | TRITON_ATTN | 20.75 | 2,817 | 0.0008 |
-| GPTQ-Int8 + int8 KV cache | TRITON_ATTN | 20.75 | 2,834 | 0.0130 |
+| config | attention | expected chat | chat req/s | batch tok/s | KL |
+|---|---|---|---|---|---|
+| baseline (bf16) | FLASH_ATTN | | 17.45 | 2,356 | 0 |
+| TRITON_ATTN attention backend | TRITON_ATTN | 1.00x | 21.67 (1.24x) | 2,623 | 0.0007 |
+| GPTQ-Int8 + TRITON_ATTN (recommended) | TRITON_ATTN | 1.27x | 20.75 (1.19x) | 2,883 | 0.0008 |
+| GPTQ-Int8 + int8 KV cache + TRITON_ATTN | TRITON_ATTN | 1.18x | 20.75 (1.19x) | 2,889 | 0.0130 |
+| GPTQ-Int8 + TRITON_ATTN + ngram speculative decoding | TRITON_ATTN | 0.99x | 14.67 (0.84x) | 2,098 | 0.0008 |
+| fp8 weights + TRITON_ATTN | TRITON_ATTN | 1.29x | 21.67 (1.24x) | 2,919 | 0.0069 |
+| fp8 weights + int8 KV cache + TRITON_ATTN | TRITON_ATTN | 1.25x | 20.75 (1.19x) | 2,946 | 0.0200 |
+| turboquant KV cache (`turboquant_k8v4`) | FLASH_ATTN+TURBOQUANT | 0.95x | 17.45 (1.00x) | 2,451 | 0.0006 |
 
-Chat capacity is the highest arrival rate at which 90% of requests got their first token within 1 s and every later token within 50 ms on average, with 256-token prompts and 128-token answers arriving at random. Batch is 512 such requests sent at once. Requests sample with the defaults in the model's `generation_config.json`, which for Qwen2.5 are temperature 0.7, top-k 20, top-p 0.8 and a repetition penalty of 1.1.
+Chat capacity is the highest arrival rate at which 90% of requests got their first token within 1 s and every later token within 50 ms on average, with 256-token prompts and 128-token answers arriving at random. Batch is 512 such requests sent at once. Requests sample with the defaults in the model's `generation_config.json`, which for Qwen2.5 are temperature 0.7, top-k 20, top-p 0.8 and a repetition penalty of 1.1. "Expected chat" is the planner's prediction before it served the config.
 
-Offline, TRITON_ATTN ran at 0.99x the baseline (2,857 against 2,872 tok/s); under load it served 24% more chat traffic. On this GPU, FlashAttention 2 ran a batch of decodes three to six times slower once a prefill joined it. A server adds each new request's prefill to the batch of running decodes, while the offline throughput test prefills every request first and then only decodes. The int8 KV cache runs on TRITON_ATTN as well and reached the same chat capacity.
+Offline, TRITON_ATTN ran at 0.99x the baseline (2,857 against 2,872 tok/s); under load it served 24% more chat traffic. On this GPU, FlashAttention 2 ran a batch of decodes three to six times slower once a prefill joined it. A server adds each new request's prefill to the batch of running decodes, while the offline throughput test prefills every request first and then only decodes. The planner served TRITON_ATTN first anyway: it serves each setting at least once before it may stop, and its prediction for TRITON_ATTN, taken from the offline result, was uncertain enough that TRITON_ATTN still won a fifth of the draws.
 
-Six configs reached 20.75 req/s. At the next rate tried, 21.67 req/s, all six missed the 50 ms limit twice, with TPOT p90 between 51 and 55 ms, so chat capacity does not separate them. Among those also within 10% of the best batch throughput, vllm-dyno recommends the lowest KL: the GPTQ-Int8 checkpoint with TRITON_ATTN, at 1.24x the baseline's chat capacity and 1.22x its batch throughput.
+Five configs reached 20.75 or 21.67 req/s, one bisection step apart, so chat capacity does not separate them. Among those also within 10% of the best batch throughput, vllm-dyno recommends the lowest KL: the GPTQ-Int8 checkpoint with TRITON_ATTN, at 1.19x the baseline's chat capacity and 1.22x its batch throughput. Serving every allowed config gave the same recommendation.
 
 `dyno serve <run directory>` starts `vllm serve` with the recommended config and the environment the trials ran in.
 
@@ -63,9 +59,11 @@ uv sync --extra vllm
 uv run dyno run <model> --dry-run    # the plan, without loading anything on the GPU
 ```
 
+[program.md](program.md) walks a coding agent such as Claude Code or Codex through a whole run.
+
 ## How it works
 
-Numbers in this section were measured on the RTX 3070 with Qwen2.5-1.5B-Instruct.
+Numbers in this section were measured on the RTX 3070 with Qwen2.5-1.5B-Instruct unless they name another model.
 
 Before loading anything, vllm-dyno reads the GPU's free memory and compute capability, checks for nvcc, works out the model's weight size and KV cache bytes per token, and looks up the most downloaded quantized checkpoints of the model on the Hugging Face Hub, one per method and bit width. Only checkpoints published by the base model's owner count unless you pass `--any-owner`, since the recommended weights end up in production. Every model is pinned to the commit measured, and the recommended `vllm serve` command carries that `--revision`. vllm-dyno never runs code from a model repo (`trust_remote_code` stays off). It skips configs known to fail on this machine and logs the reason.
 
@@ -90,36 +88,77 @@ Every trial is a line in `runs/<run>/trials.jsonl`, with its vLLM log in `runs/<
 
 `dyno load <run directory>` starts `vllm serve` once per config, with vLLM's serving defaults, and runs both traffic profiles against it. It finds chat capacity by doubling the rate from 2 req/s until a probe fails, then bisecting to within 5%. A probe stops as soon as so many requests have missed the SLO that it can no longer pass. Every request carries its own `cache_salt`, so prompts that repeat do not hit the prefix cache.
 
-Each `dyno load` measures the baseline first and compares every config against that measurement, since results drift between sessions: the baseline's chat capacity has differed by 9%, more than fp8 or GPTQ-Int8 weights changed it. By default, `dyno load` serves every setting the offline run kept within the quality limit, including those that gained less than 5% offline, like TRITON_ATTN at 1.00x in the screen. Then it serves up to eight combinations of the settings that gained 10% or more on chat capacity or batch throughput, each after an offline trial for its KL. A combination that sets the attention backend is skipped when the same config without that setting was loaded and the server picked that backend anyway: int8 KV cache runs on TRITON_ATTN either way. Results go to `runs/<run>/load.jsonl`, with each server's log in `runs/<run>/load/`.
+Each `dyno load` measures the baseline first and compares every config against that measurement, since results drift between sessions: the baseline's chat capacity has differed by 9%, more than fp8 or GPTQ-Int8 weights changed it. The configs it may serve are every combination of settings that each stayed within the quality limit offline. A combination gets an offline trial for its KL before its server starts. A config that sets the attention backend is skipped when the same config without that setting was loaded and the server picked that backend anyway: the int8 KV cache runs on TRITON_ATTN either way. Results go to `runs/<run>/load.jsonl`, with each server's log in `runs/<run>/load/`.
 
 ### Stalls and slowdowns
 
-Before measuring a server, `dyno load` sends bursts of short requests at every batch size up to 64 and a few above it. vLLM compiles its Triton top-k/top-p sampling kernels the first time each range of batch sizes needs them, and its own warmup leaves them out. Each round of compiles holds the server up for 2.7 to 4.2 seconds, long enough to fail a chat probe.
+Before measuring a server, `dyno load` sends bursts of short requests at every batch size up to 64 and a few above it. vLLM compiles its Triton top-k/top-p sampling kernels the first time each range of batch sizes needs them, and its own warmup leaves them out. Each round of compiles holds the server up for 2.7 to 4.2 seconds, long enough to fail a chat probe. A server whose start compiled the model's graph is started a second time and measured from vLLM's compile cache: vLLM sizes the KV cache from the memory peak of its start, and a start that compiles reports a higher peak. With Qwen3-1.7B, a compiling start left 7,888 tokens of KV cache and a cached start 12,528.
 
 Two checks catch a server that runs slower than its config should. Before the search, two requests sent one at a time and decoded greedily must not run more than 1.5 times slower per token than the offline trial of the same config. Speculative configs skip this check, since how fast they decode depends on the text. After the batch profile, a probe at 2 req/s must not run more than 1.2 times slower than the first probe did. A server that fails either check is marked degraded and started once more, and a config degraded twice is left out of the comparison. The failing rate at which the search stops is probed a second time, so a single stall does not set the capacity.
 
 Under WSL, the Windows graphics driver moves GPU memory into system memory instead of refusing an allocation, and PyTorch only frees its cache of unused blocks after an allocation fails. A server whose cache grows past the GPU then slows down without an error: with 2 GiB spilled, TPOT p90 at 16 req/s was 72 ms against 25 ms with the cache capped. vllm-dyno caps PyTorch's allocator at `gpu_memory_utilization` (`PYTORCH_CUDA_ALLOC_CONF=per_process_memory_fraction`) for trials and servers, and leaves 1.5 GiB of GPU memory for the Windows desktop to grow into. The recommended command carries the same setting.
 
-### Choosing configs with an LLM
+### Choosing which configs to serve
 
-`dyno load --planner llm` replaces the fixed order with a language model that picks one config at a time. After the baseline, vllm-dyno sends it the GPU and model, the SLO, every offline trial, every config loaded so far with its gains, its own earlier picks next to what they measured, and the configs it may pick: every combination of settings that each stayed within the quality limit offline. The model answers with a config, the gains it expects and why, or with a stop. A combination still gets its offline KL trial before a server starts, and `--max-servers` caps the servers. If the endpoint fails, or the model twice names a config outside the list, the fixed order finishes the session and reuses every config already loaded. Whichever finishes the session, the recommendation follows the same rule. Each pick goes into `runs/<run>/plan.jsonl` and the report with its reasoning, its expected and measured gains, and the tokens the endpoint counted.
+`--planner` picks how `dyno load` chooses the next config to serve:
 
-A stop counts only once the effect of every setting the model may change is known: two configs that served, or one and the baseline, must differ in that setting alone. The models reason from offline speed, which misjudges the attention backend. Without any stop rule, two of four earlier sessions stopped after fp8 weights at 1.00x the baseline's chat capacity. A rule that only asked for each setting to be loaded once did not help: Nemotron put the int8 KV cache, TRITON_ATTN and ngram into a single config, expected 0.70x, measured 0.88x, stopped, and recommended fp8 weights at 1.04x.
+- `fit`, the default, fits a model of each setting's gain under load and serves the config likeliest to be recommended.
+- `rules` serves every setting on its own, then up to eight combinations of the settings that gained 10% or more on chat capacity or batch throughput.
+- `llm` asks a language model through any OpenAI-compatible endpoint.
+- `all` serves every allowed config, which measures the whole space.
 
-Under the current rule, in sessions run back to back:
+Whichever planner chose them, the recommendation follows the same rule over the configs served. Each pick goes into `runs/<run>/plan.jsonl` and the report, with the planner's reasoning and its expected and measured gains.
 
-| planner | servers | minutes | recommended | chat | batch | KL | tokens in / out |
+The fit planner models a config's log chat gain, and its log batch gain, as a sum of one weight per value the config changes from the baseline. Each weight starts from half the log offline throughput gain of its value, since offline speed misjudges some settings under load, and every server's measurement updates the weights by Bayesian linear regression. vLLM picks the attention backend by the KV cache format, so a config that leaves the backend to vLLM counts as running the backend that servers with its KV cache format picked. At each step the planner draws 256 sets of gains from the fit, applies the recommendation rule to each, and serves the config that the most draws recommend.
+
+No planner may stop before the effect of every setting it can change is known: two configs that served, or one and the baseline, must differ in that setting alone, or the one with the setting must have failed to serve. Planners that judge by offline speed otherwise stop before serving the attention backend. Once every effect is known, the fit planner stops when no config left would be recommended in 10% of the draws if it were served next.
+
+#### How the planners compare
+
+To compare planners on the same footing, `--planner all` served every allowed config of both models; that set of measurements is the ground truth. `dyno replay` then runs a planner many times against those records instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. A replayed session recommends by the same rule as a real one, and is scored by whether its pick matches the recommendation over every config's mean gains, or falls among the configs tied with it (within 10% on both profiles). GPU minutes add the servers' and the offline trials' wall time.
+
+Over 100 replayed sessions per planner, with chat as the goal:
+
+| Qwen2.5-1.5B-Instruct (the full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
+|---|---|---|---|---|
+| rules | 10.0 | 81 | 1.00 | 1.00 |
+| fit | 6.1 | 53 | 1.00 | 1.00 |
+| fit, 5 servers | 5.0 | 45 | 0.98 | 1.00 |
+| Optuna TPE, 10 servers | 10.0 | 88 | 0.98 | 1.00 |
+| Optuna TPE, 5 servers | 5.0 | 45 | 0.59 | 1.00 |
+| random, 10 servers | 10.0 | 89 | 0.37 | 1.00 |
+| random, 5 servers | 5.0 | 48 | 0.16 | 0.92 |
+
+| Qwen3-1.7B (8 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
+|---|---|---|---|---|
+| rules | 13.2 | 106 | 0.03 | 0.94 |
+| fit | 8.7 | 81 | 0.34 | 0.95 |
+| fit, 5 servers | 5.0 | 49 | 0.13 | 0.80 |
+| Optuna TPE, 10 servers | 10.0 | 98 | 0.15 | 0.99 |
+| Optuna TPE, 5 servers | 5.0 | 52 | 0.09 | 0.99 |
+| random, 10 servers | 10.0 | 98 | 0.12 | 0.90 |
+| random, 5 servers | 5.0 | 52 | 0.06 | 0.74 |
+
+Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are tied with the truth there, and which of them a session ends on decides the "same pick" column. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules.
+
+Real sessions, each on a copy of the same offline run, measured by the same load code:
+
+| model | planner | servers | minutes | recommended | chat | batch | KL |
 |---|---|---|---|---|---|---|---|
-| fixed order | 11 | 75 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.22x | 0.0008 | none |
-| fixed order | 11 | 72 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.22x | 0.0008 | none |
-| Nemotron 3 Super | 8 | 57 | fp8 + TRITON_ATTN | 1.19x | 1.20x | 0.0069 | 23,226 / 11,792 |
-| Nemotron 3 Super | 6 | 46 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.23x | 0.0008 | 16,823 / 9,069 |
-| Claude Opus 5.5 | 6 | 44 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.24x | 0.0008 | 23,364 / 3,736 |
-| Claude Opus 5.5 | 6 | 45 | GPTQ-Int8 + TRITON_ATTN | 1.24x | 1.23x | 0.0008 | 23,364 / 3,426 |
+| Qwen2.5-1.5B | fit | 7 | 58 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.22x | 0.0008 |
+| Qwen2.5-1.5B | all | 20 | 207 | GPTQ-Int8 + TRITON_ATTN | 1.19x | 1.23x | 0.0008 |
+| Qwen3-1.7B | fit | 8 | 68 | GPTQ-Int8 + int8 KV cache | 1.68x | 1.49x | 0.0292 |
+| Qwen3-1.7B | rules | 13 | 110 | GPTQ-Int8 + int8 KV cache | 1.61x | 1.50x | 0.0292 |
+| Qwen3-1.7B | rules | 13 | 97 | GPTQ-Int8 + int8 KV cache | 1.68x | 1.50x | 0.0292 |
+| Qwen3-1.7B | Nemotron 3 Super | 4 | 45 | fp8 + int8 KV cache | 1.68x | 1.56x | 0.0378 |
+| Qwen3-1.7B | Nemotron 3 Super | 6 | 55 | fp8 + int8 KV cache | 1.68x | 1.66x | 0.0378 |
+| Qwen3-1.7B | Claude Opus 5.5 | 6 | 63 | fp8 + TRITON_ATTN | 1.48x | 1.37x | 0.0111 |
+| Qwen3-1.7B | Claude Opus 5.5 | 6 | 62 | GPTQ-Int8 + int8 KV cache + TRITON_ATTN | 1.68x | 1.48x | 0.0270 |
+| Qwen3-1.7B | all | 27 | 270 | GPTQ-Int8 + int8 KV cache | 1.61x | 1.51x | 0.0292 |
 
-Servers include the baseline. Chat and batch are multiples of each session's own baseline, whose chat capacity came out at 16.00, 16.71 or 17.45 req/s, one bisection step apart. Both Opus sessions took the same path: fp8 weights, then TRITON_ATTN on top, then the int8 KV cache and ngram one at a time, then GPTQ-Int8 with TRITON_ATTN to win the tie on KL. Nemotron opened with fp8 weights in one session and with ngram in the other. In the first it never served GPTQ-Int8 with TRITON_ATTN, and recommended fp8 weights with TRITON_ATTN, as fast but at a KL of 0.0069 against 0.0008.
+Servers do not count the baseline; minutes are wall time. Chat and batch are multiples of each session's own baseline, so one bisection step of the baseline moves a ratio by 4 to 9%. The Qwen2.5 sweep ran in two sessions; its minutes leave out the pause between them.
 
-The planner talks to any OpenAI-compatible endpoint. By default that is Nemotron 3 Super on OpenRouter's free tier, with the API key in `OPENROUTER_API_KEY`:
+The LLM planner sends the model the GPU and model, the SLO, every offline trial, every config served so far with its gains, its own earlier picks next to what they measured, and the configs it may pick. It answers with a config, the gains it expects and why, or with a stop. If the endpoint fails, or the model twice names a config outside the list, the rules finish the session and reuse every config already served. By default the endpoint is Nemotron 3 Super on OpenRouter's free tier, with the API key in `OPENROUTER_API_KEY`:
 
 ```
 uv run dyno load runs/<run> --planner llm
@@ -128,9 +167,15 @@ uv run dyno load runs/<run> --planner llm --planner-url https://api.anthropic.co
 
 vllm-dyno takes the key out of its own environment before it starts anything, so neither vLLM nor the trials inherit it, and it writes the key nowhere.
 
+`dyno replay` replays any planner over finished runs measured the same way: one model, GPU, memory budget, vLLM version, offline reference and load code. The Optuna planner needs the `bench` extra (`uv sync --extra bench`):
+
+```
+uv run dyno replay runs/<sweep> runs/<other session> --planner fit --repeats 100
+```
+
 ## Options
 
-`dyno run --help` and `dyno load --help` list all options. The ones most runs need:
+`dyno run --help`, `dyno load --help` and `dyno replay --help` list all options. The ones most runs need:
 
 - `--max-kl` sets the quality limit (default 0.05).
 - `dyno run --goal latency` ranks configs by time per output token instead of throughput.
@@ -138,7 +183,7 @@ vllm-dyno takes the key out of its own environment before it starts anything, so
 - `dyno load --goal batch` recommends the config with the highest batch throughput instead of chat capacity.
 - `dyno load --slo-ttft-ms`, `--slo-tpot-ms` and `--slo-share` set the SLO (defaults 1000 ms, 50 ms and 90% of requests).
 - `dyno load --config <label>` loads the named configs instead of searching.
-- `dyno load --planner llm` lets a language model choose the configs to load; `--planner-url`, `--planner-model` and `--planner-key-env` pick the endpoint, the model and the variable that holds its API key, and `--max-servers` caps the servers it starts (default 10).
+- `dyno load --planner` picks the planner (`fit`, `rules`, `llm` or `all`); `--max-servers` caps the servers the fit and LLM planners start (default 10). `--planner-url`, `--planner-model` and `--planner-key-env` pick the LLM planner's endpoint, model and the variable that holds its API key.
 - `--gpu-price` adds cost per million output tokens, given USD per GPU hour.
 - `--text` measures quality and speed on your own text instead of WikiText-2.
 - `--checkpoint` adds a quantized checkpoint that discovery did not pick.
@@ -149,11 +194,11 @@ vllm-dyno takes the key out of its own environment before it starts anything, so
 - Load traffic is synthetic: 256-token prompts and 128-token answers, with no shared prefixes.
 - Requests sample with the model's own defaults. Clients that send other sampling parameters get different capacity: on the RTX 3070 with GPTQ-Int8 and TRITON_ATTN, greedy requests reached 21.67 req/s and Qwen2.5's defaults 19.87.
 - Without nvcc on PATH, as under WSL, FlashInfer is unavailable: its attention backend, fp8 KV cache below compute capability 8.9, and its sampler, so vLLM samples with Triton kernels instead.
-- Chat capacity comes in bisection steps of 4 to 9%, and each config is loaded once, so configs within 10% of each other count as a tie.
+- Chat capacity comes in bisection steps of 4 to 9%, and each config is served once per session, so configs within 10% of each other count as a tie.
 - `max_num_seqs` and `max_num_batched_tokens` stay at vLLM's serving defaults, 256 and 2,048 on GPUs under 70 GiB. Raising them did not help on the RTX 3070. With the GPTQ-Int8 checkpoint and int8 KV cache, the batch profile used 38% of the cache, and `--max-num-seqs 512` lowered batch throughput from 2,850 to 2,513 tok/s. With GPTQ-Int8 and TRITON_ATTN, `--max-num-batched-tokens 4096` left batch throughput level and raised TPOT p90 at 21.67 req/s from 51 to 54 ms.
 - KL is computed over the baseline's top 20 tokens and reads slightly low.
-- The planner has run four sessions under its current stop rule, all with one model on one GPU. There one setting, TRITON_ATTN, explains most of the gain, and the planner's prompt names attention backends as what offline speed misjudges. Whether it beats the fixed order where nobody knows the answer in advance is untested. The endpoint samples with its own defaults, so two sessions can pick differently.
-- The planner sends the GPU and model names and the measurements to its endpoint; check the provider's data policy. Free models on OpenRouter are rate limited.
+- The planners were compared on two models on one GPU. The fit planner's starting weights and noise were not tuned on other models, and the LLM planner's endpoint samples with its own defaults, so two of its sessions can pick differently.
+- The LLM planner sends the GPU and model names and the measurements to its endpoint; check the provider's data policy. Free models on OpenRouter are rate limited.
 - One GPU, no tensor parallelism.
 - Tested only on an RTX 3070 with vLLM 0.31.
 
