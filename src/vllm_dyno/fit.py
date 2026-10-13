@@ -3,7 +3,9 @@
 A config's log chat gain, and its log batch gain, is the sum of one weight per value it changes from the
 baseline. A weight starts from PRIOR_SHRINK times the log offline throughput gain of its value's screen
 trial, and every load record of the run, against the baseline of its own session, updates it by Bayesian
-linear regression.
+linear regression. vLLM picks the attention backend by the KV cache format, so a config that leaves the
+backend to vLLM counts as naming the backend that servers with its KV cache format picked: otherwise the
+weight of that format would hold the backend's effect too, and a config naming both would count it twice.
 
 At each step the planner draws gains of the configs it may pick from the fit, keeps the measured gains of
 the configs that served, and applies the report's recommendation rule to each draw. A config's win
@@ -21,14 +23,14 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from statistics import NormalDist
 
 from .load import MIN_RATE, gains, load_records, session_baseline
 from .planner import Proposal, Step
 from .report import load_scores, load_winner, quality
 from .search import Goal, candidate_of
-from .space import DEFAULTS, KNOBS, Candidate
+from .space import DEFAULTS, KNOBS, VALUES, Candidate
 
 # the share of a value's log offline throughput gain its weight starts from: offline speed ranks
 # configs, but a server mixes prefills into its decode batches and can rank them differently
@@ -123,6 +125,25 @@ def prior_mean(records: list[dict], value: Value) -> float:
     return PRIOR_SHRINK * math.log(single["tput_tok_s"] / base["tput_tok_s"])
 
 
+def picked_backends(load: list[dict]) -> dict[str, str]:
+    """Per KV cache format other than the default, a named backend that a server of a config with it picked."""
+    return {
+        r["kv_cache_dtype"]: r["backend"]
+        for r in load
+        if r["status"] == "ok"
+        and r["kv_cache_dtype"] != DEFAULTS["kv_cache_dtype"]
+        and r["attention_backend"] == DEFAULTS["attention_backend"]
+        and r.get("backend") in VALUES["attention_backend"]
+    }
+
+
+def engine(c: Candidate, backends: dict[str, str]) -> Candidate:
+    """c naming the backend that servers with its KV cache format picked, if it leaves the backend to vLLM."""
+    if c.attention_backend == DEFAULTS["attention_backend"] and c.kv_cache_dtype in backends:
+        return c.replace(attention_backend=backends[c.kv_cache_dtype])
+    return c
+
+
 @dataclass(frozen=True)
 class Fit:
     """One weight per value for the log chat gain and one for the log batch gain."""
@@ -130,10 +151,11 @@ class Fit:
     values: list[Value]
     chat: Posterior
     batch: Posterior
+    backends: dict[str, str] = field(default_factory=dict)  # from picked_backends()
 
     def x(self, c: Candidate) -> list[float]:
-        """Which of the values c sets, as 0 or 1."""
-        changed = set(c.changes().items())
+        """Which of the values c's engine sets, as 0 or 1."""
+        changed = set(engine(c, self.backends).changes().items())
         return [float(v in changed) for v in self.values]
 
     def predicted_gains(self, c: Candidate) -> dict[str, list[float]]:
@@ -148,12 +170,13 @@ class Fit:
 def fit(records: list[dict], load: list[dict], cands: list[Candidate]) -> Fit:
     """Weights fitted to every load record that served, but the baselines, for the values of those and of cands."""
     served = [r for r in load if r["status"] == "ok" and r["label"] != "baseline"]
-    found = {v for c in [*cands, *map(candidate_of, served)] for v in c.changes().items()}
+    backends = picked_backends(load)
+    found = {v for c in [*cands, *map(candidate_of, served)] for v in engine(c, backends).changes().items()}
     values = sorted(found, key=lambda v: (KNOBS.index(v[0]), v[1]))
     prior = [prior_mean(records, v) for v in values]
     rows: dict[str, tuple[list[list[float]], list[float]]] = {"chat": ([], []), "batch": ([], [])}
     for r in served:
-        changed = set(candidate_of(r).changes().items())
+        changed = set(engine(candidate_of(r), backends).changes().items())
         base = session_baseline(load, r)
         chat, batch = gains(r, base)
         if chat == 0 and base is not None:
@@ -163,7 +186,7 @@ def fit(records: list[dict], load: list[dict], cands: list[Candidate]) -> Fit:
             if g:  # None without a baseline to compare with; a batch that finished no request has no log gain
                 rows[name][0].append([float(v in changed) for v in values])
                 rows[name][1].append(math.log(g))
-    return Fit(values, posterior(*rows["chat"], prior), posterior(*rows["batch"], prior))
+    return Fit(values, posterior(*rows["chat"], prior), posterior(*rows["batch"], prior), backends)
 
 
 def predicted_kl(records: list[dict], c: Candidate) -> float:

@@ -200,6 +200,21 @@ def test_a_config_that_missed_the_slo_at_every_rate_drags_down_the_chat_of_its_c
     assert p.config is not None and p.config.weights == "base"
 
 
+def test_a_server_running_the_backend_its_kv_cache_format_picked_counts_that_backend_once(tmp_path, ctx):
+    loads = [
+        served("baseline", 10, 1000) | {"backend": "FLASH_ATTN"},
+        served(TRITON, 13, 1000) | {"backend": "TRITON_ATTN"},
+        served(INT8, 13, 1000) | {"backend": "TRITON_ATTN"},  # its server picked TRITON_ATTN itself
+        served(FP8, 10, 1000) | {"backend": "FLASH_ATTN"},
+    ]
+    s = step(tmp_path, ctx, SETTLED, loads)
+    model = fit.fit(s.session.run.records, loads, s.options)
+    assert model.backends == {"int8_per_token_head": "TRITON_ATTN"}
+    # fp8 + int8 KV runs the engine fp8 + int8 KV + TRITON_ATTN names: 1.3x, TRITON_ATTN's gain, not 1.3² = 1.69x
+    for label in (f"{FP8} {INT8}", f"{FP8} {INT8} {TRITON}"):
+        assert model.predicted_gains(cand(label))["chat"][0] == pytest.approx(1.3, rel=0.03)
+
+
 NEAR_LIMIT = [  # fp8 and int8 KV are each within the KL limit of 0.05, and their KLs add up to more
     screen("baseline", 1000, 0.0),
     screen(FP8, 1000, 0.03),
