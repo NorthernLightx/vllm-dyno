@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 from dataclasses import asdict
 
 import httpx
@@ -525,6 +526,30 @@ def test_a_server_that_stops_answering_once_it_served_is_recorded_with_the_cause
         "RuntimeError: CUDA error: an illegal memory access was encountered"
     )
     assert record["wall_s"] >= 0 and "capacity_rps" not in record
+
+
+@pytest.mark.parametrize(
+    ("compiles", "said"),
+    [
+        (0, []),
+        (1, ["the server compiled the model's graph; starting it again from vLLM's compile cache"]),
+        (
+            2,
+            [
+                "the server compiled the model's graph; starting it again from vLLM's compile cache",
+                "the second start compiled the graph again, so its KV cache may come out smaller",
+            ],
+        ),
+    ],
+)
+def test_a_start_again_after_compiling_is_logged_and_a_second_compile_warned(
+    tmp_path, monkeypatch, ctx, caplog, compiles, said
+):
+    caplog.set_level(logging.INFO, logger="vllm_dyno.load")
+    measure(tmp_path, monkeypatch, ctx, 8.9, compiles=compiles)
+    lines = [r.getMessage().removeprefix("load     ") for r in caplog.records if "compile" in r.getMessage()]
+    assert lines == said
+    assert [r.levelname for r in caplog.records if "again, so" in r.getMessage()] == ["WARNING"] * (compiles == 2)
 
 
 @pytest.mark.parametrize(("compiles", "kv_tokens", "started"), [(0, 44624, 1), (1, 44624, 2), (2, 28000, 2)])

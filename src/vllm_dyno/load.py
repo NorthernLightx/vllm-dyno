@@ -487,8 +487,11 @@ def serving_from_cache(argv: list[str], log_path: Path, env: dict[str, str], tim
         if COMPILED_LINE not in log_path.read_text(errors="replace"):
             yield url
             return
+    log.info("load     the server compiled the model's graph; starting it again from vLLM's compile cache")
     log_path.replace(log_path.with_name("server-compile.log"))
     with serving(argv, log_path, env, timeout_s) as url:
+        if COMPILED_LINE in log_path.read_text(errors="replace"):
+            log.warning("load     the second start compiled the graph again, so its KV cache may come out smaller")
         yield url
 
 
