@@ -7,8 +7,9 @@ config within the limit starts a server, so the budget counts servers.
 
 A stop counts only once the effect under load of every setting the proposer may change is known: offline
 speed can misjudge a setting under load, and a proposer that judges by it stops before loading that setting.
-An effect is known once two configs that served, or one and the baseline, differ in that setting alone;
-a config that changes several untried settings at once shows none of their effects.
+An effect is known once two configs that served, or one and the baseline, differ in that setting alone,
+or once a config failed to serve where the same config without that setting served; a config that
+changes several untried settings at once shows none of their effects.
 
 LlmProposer asks a chat model through any OpenAI-compatible endpoint. It shows the model the machine,
 the offline trials, the load records so far and its earlier picks with what they measured. AllProposer
@@ -28,6 +29,7 @@ import dataclasses
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product
@@ -408,10 +410,22 @@ def remaining(session: LoadSession, goal: Goal, journal: list[dict]) -> list[Can
     return [c for c in allowed(session.ctx, session.run.records, goal.max_kl) if c.label() not in done | failed]
 
 
+def failed_under_load(load: list[dict]) -> set[Candidate]:
+    """Configs whose server failed: a record that is neither ok nor degraded, or two degraded ones."""
+    degraded = Counter(r["label"] for r in load if r["status"] == "degraded")
+    return {candidate_of(r) for r in load if r["status"] not in ("ok", "degraded") or degraded[r["label"]] > 1}
+
+
 def untried(session: LoadSession, options: list[Candidate]) -> list[str]:
-    """Settings that a remaining config changes and that no two configs that served differ in alone."""
-    served = {candidate_of(r) for r in load_records(session.run.path) if r["status"] == "ok"}
-    known = {k for c in served for k in c.changes() if c.replace(**{k: DEFAULTS[k]}) in served}
+    """Settings that a remaining config changes and whose effect under load no two loaded configs show.
+
+    A config that served shows the effect of each setting it changes from another config that served; so
+    does one that failed to serve, as a setting whose configs fail would otherwise keep a stop refused.
+    """
+    load = load_records(session.run.path)
+    served = {candidate_of(r) for r in load if r["status"] == "ok"}
+    shown = served | failed_under_load(load)
+    known = {k for c in shown for k in c.changes() if c.replace(**{k: DEFAULTS[k]}) in served}
     return [k for k in KNOBS if k not in known and any(k in c.changes() for c in options)]
 
 

@@ -20,6 +20,7 @@ from vllm_dyno.planner import (
     parse,
     plan,
     remaining,
+    untried,
 )
 from vllm_dyno.report import load_recommendation
 from vllm_dyno.runner import Run
@@ -414,6 +415,26 @@ def test_a_config_whose_every_earlier_load_degraded_is_offered_again(tmp_path, m
     assert "weights=fp8" in labels
     assert not {"attention_backend=TRITON_ATTN", "kv_cache_dtype=int8_per_token_head"} & labels
     assert "weights=fp8" not in {c.label() for c in remaining(s, Goal(), [{"config": "weights=fp8"}])}
+
+
+def test_a_setting_is_known_once_its_config_failed_to_serve_where_the_same_without_it_served(
+    tmp_path, monkeypatch, ctx
+):
+    s, _, _, _ = setup(tmp_path, monkeypatch, ctx, [])
+    loads = [
+        ("baseline", "ok"),
+        ("kv_cache_dtype=int8_per_token_head", "crash"),
+        ("weights=fp8", "degraded"),  # started once more in a later session, it may serve
+        ("attention_backend=TRITON_ATTN", "degraded"),
+        ("attention_backend=TRITON_ATTN", "degraded"),
+        ("weights=fp8 attention_backend=TRITON_ATTN", "oom"),  # neither config without one of its settings served
+    ]
+    (tmp_path / "load.jsonl").write_text(
+        "".join(json.dumps({"label": label, **asdict(cand(label)), "status": status}) + "\n" for label, status in loads)
+    )
+    options = remaining(s, Goal(), [])
+    assert any("kv_cache_dtype" in c.changes() for c in options)
+    assert untried(s, options) == ["weights"]
 
 
 def test_the_all_planner_keeps_to_a_server_budget_it_is_given(tmp_path, monkeypatch, ctx):
