@@ -15,6 +15,11 @@ run measured, under load or offline, ends its repeat as a gap: nothing is estima
 fails ends its repeat as a fallback: `dyno load` hands its session to the rules, whose pick is not
 the proposer's.
 
+GPU minutes add the servers' wall time and that of the offline trials a repeat ran. A server whose
+first start compiled the model's graph started again from vLLM's compile cache, and only the second
+start counts, so every server is charged as on a machine that compiled it before. An offline trial
+keeps its recorded time, compile included where its run was the first to compile that graph.
+
 The truth is the recommendation report.load_recommendation makes over every config's mean gains,
 together with the configs it counts as tied. Each repeat is scored by the config its own records
 recommend: whether that runs the truth's engine (exact) or the engine of a tied config (tied), and
@@ -32,10 +37,12 @@ import json
 import logging
 import math
 import random
+import re
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING
@@ -60,6 +67,7 @@ OPTUNA_QUEUED = 3  # configs with the best offline estimate, measured before TPE
 OPTUNA_ASKS = 100  # answers to configs already measured before a step draws at random instead
 OTHER_WEIGHT = 0.1  # weight of the other profile's log gain in the score TPE maximises
 SMALLEST_GAIN = 1e-3  # stands in for no capacity at all, whose log is undefined
+LOG_TIME = re.compile(r"\b(\d\d-\d\d \d\d:\d\d:\d\d)\b")  # as vLLM's log lines carry it, without a year
 
 Drive = Callable[[LoadSession, int], None]  # runs one session; the int seeds its planner
 
@@ -82,7 +90,7 @@ def _hand_over(session: LoadSession, goal: Goal, max_combos: int, trial_timeout_
 
 @dataclass(frozen=True)
 class Replicate:
-    record: dict  # a load record
+    record: dict  # a load record, its wall time without a first start that compiled
     chat: float | None  # its gains against the baseline of its session; None if it did not serve
     batch: float | None
 
@@ -148,6 +156,29 @@ def _measured_by(meta: dict, settings: dict) -> dict:
     }
 
 
+def _first_time(log: Path) -> datetime | None:
+    for line in log.read_text(errors="replace").splitlines():
+        if m := LOG_TIME.search(line):
+            return datetime.strptime(f"2000-{m[1]} +0000", "%Y-%m-%d %H:%M:%S %z")  # a leap year takes any date
+    return None
+
+
+def warm_wall_s(run_dir: Path, r: dict) -> float | None:
+    """r's wall time without its server's first start, where that start compiled the model's graph.
+
+    load.serving_from_cache keeps the log of such a start as server-compile.log, next to the log of the
+    start that served; the time between their first lines is what the first start took.
+    """
+    out = run_dir / r.get("dir", "")
+    first, served = out / "server-compile.log", out / "server.log"
+    if r.get("wall_s") is None or not r.get("dir") or not first.exists() or not served.exists():
+        return r.get("wall_s")
+    began, again = _first_time(first), _first_time(served)
+    if began is None or again is None:
+        return r["wall_s"]
+    return max(r["wall_s"] - (again - began).total_seconds(), 0.0)
+
+
 def recorded(dirs: Sequence[Path]) -> Recorded:
     """The trials and load records of runs measured the same way; the first run's offline trials start each session."""
     metas, settings = [], []
@@ -175,6 +206,7 @@ def recorded(dirs: Sequence[Path]) -> Recorded:
         if other := list(dict.fromkeys(r.get("load_sha") for r in load_ if r.get("load_sha") != s["load_sha"])):
             raise SystemExit(f"{d}/load.jsonl holds records of other load code than its load.json: {other}")
         for r in load_:
+            r = r | {"wall_s": warm_wall_s(d, r)}
             if r["label"] == "baseline":
                 if r["status"] == "ok" and r["capacity_rps"]:
                     baselines.append(r)
@@ -353,11 +385,13 @@ def repeat(rec: Recorded, best: Truth, drive: Drive, i: int, seed: int, target: 
         picks = planner.plan_records(path)
     # plan() hands over from inside the except clause that caught the proposer's error
     fallback = {"step": len(picks) + 1, "error": str(handed.__context__)} if handed else None
+    offline_min = sum(r.get("wall_s") or 0.0 for r in records[len(rec.snapshot) :]) / 60
     outcome = {
         "repeat": i,
         "loaded": [r["label"] for r in served],
         "servers": sum(r["label"] != "baseline" for r in served),
-        "gpu_min": sum(r.get("wall_s") or 0.0 for r in served) / 60,
+        "gpu_min": sum(r.get("wall_s") or 0.0 for r in served) / 60 + offline_min,
+        "offline_min": offline_min,
         "tokens": _tokens(picks),
         "plan": picks,
         "gap": gap,
@@ -558,6 +592,7 @@ def summarize(outcomes: list[dict]) -> dict:
         "completed": len(done),
         "servers": fmean(o["servers"] for o in done) if done else None,
         "gpu_min": fmean(o["gpu_min"] for o in done) if done else None,
+        "offline_min": fmean(o["offline_min"] for o in done) if done else None,
         "exact": fmean(o["exact"] for o in done) if done else None,
         "tied": fmean(o["tied"] for o in done) if done else None,
         "regret_mean": fmean(regrets) if regrets else None,
@@ -653,11 +688,12 @@ def markdown(result: dict) -> str:
             f"`{result['planner']}` over {len(result['runs'])} runs of `{result['model']}` (load code "
             f"{result['load_sha']}), goal {result['goal']}, seed {result['seed']}. Means are over the repeats "
             "that ended without a gap or a fallback to the rules; regret is the truth's mean gain on the goal "
-            "over the pick's."
+            "over the pick's. GPU minutes include the offline trials."
         ),
         "",
     ]
-    header = ["planner", "max servers", "repeats", "gaps", "fallbacks", "servers", "GPU min", "exact", "tied"]
+    header = ["planner", "max servers", "repeats", "gaps", "fallbacks", "servers", "GPU min", "offline min"]
+    header += ["exact", "tied"]
     row = [
         result["planner"],
         budget,
@@ -666,6 +702,7 @@ def markdown(result: dict) -> str:
         str(s["fallbacks"]),
         _num(s["servers"], ".1f"),
         _num(s["gpu_min"], ".0f"),
+        _num(s["offline_min"], ".0f"),
         _num(s["exact"], ".2f"),
         _num(s["tied"], ".2f"),
         _num(s["regret_mean"], ".3f"),

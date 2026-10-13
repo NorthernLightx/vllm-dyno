@@ -155,7 +155,7 @@ def test_a_rules_replay_loads_what_the_recorded_session_loaded_and_recommends_th
     assert (result["truth"]["pick"], result["truth"]["tied"]) == (FP8_INT8, [FP8_INT8, FP8_INT8_TRITON])
     s = result["summary"]
     assert (s["gaps"], s["servers"], s["exact"], s["tied"], s["regret_worst"]) == (0, 5, 1.0, 1.0, 1.0)
-    assert s["gpu_min"] == pytest.approx(6 * 400 / 60)
+    assert (s["gpu_min"], s["offline_min"]) == (pytest.approx((6 * 400 + 4 * 60) / 60), pytest.approx(4.0))
 
 
 def loading(label: str):
@@ -262,6 +262,7 @@ def test_a_same_engine_alias_no_run_tried_offline_takes_its_twins_trial_and_is_s
         "TRITON_ATTN",
     )
     assert (stand_in["kl"], stand_in["wall_s"], stand_in["stand_in"]) == (0.013, 60.0, int8["label"])
+    assert outcome["offline_min"] == pytest.approx(1.0)
 
 
 class Scripted:
@@ -296,7 +297,7 @@ def test_a_planner_that_fails_ends_its_repeat_as_a_fallback_the_rules_do_not_fin
     assert (s["completed"], s["gaps"], s["fallbacks"], s["servers"], s["exact"]) == (0, 0, 2, None, None)
     assert s["fallback_errors"] == [{"error": "HTTP 401: no key", "repeats": 2}]
     text = replay.markdown(result)
-    assert "| scripted | 3 | 2 | 0 | 2 |  |  |  |  |  |  |" in text
+    assert "| scripted | 3 | 2 | 0 | 2 |  |  |  |  |  |  |  |\n" in text
     assert "- HTTP 401: no key: 2" in text
 
 
@@ -476,6 +477,26 @@ def load_records_of(repeat, rec, best, drive, i) -> list[dict]:
     return kept[0]
 
 
+def test_a_server_is_charged_without_a_first_start_that_compiled_the_model(tmp_path, ctx):
+    path = tmp_path / "run"
+    write_run(path, ctx)
+    out = path / "load" / "001-weights-fp8"
+    out.mkdir(parents=True)
+    line = "(APIServer pid=1) INFO 10-12 {} [api_utils.py:347] vLLM API server version 0.31.0\n"
+    (out / "server-compile.log").write_text(line.format("23:59:30") + f"... {load.COMPILED_LINE} ...\n")
+    (out / "server.log").write_text(line.format("00:01:10").replace("10-12", "10-13"))
+    write_load(
+        path,
+        [
+            served("baseline", 10.0, 1000.0, "FLASH_ATTN") | {"session": "a", "dir": "load/000-baseline"},
+            served("weights=fp8", 12.0, 1200.0, "FLASH_ATTN") | {"session": "a", "dir": "load/001-weights-fp8"},
+        ],
+    )
+    rec = replay.recorded([path])
+    assert rec.baselines[0]["wall_s"] == 400.0  # no first start kept, so none compiled
+    assert [r.record["wall_s"] for r in rec.measured[cand("weights=fp8")]] == [400.0 - 100.0]
+
+
 def test_a_session_starts_from_the_trials_dyno_run_wrote_up_to_its_confirm_stage(tmp_path, monkeypatch, ctx):
     offline = [*OFFLINE, trial("confirm", "weights=fp8", 0.009, tput=2100.0)]
     path = rules_run(tmp_path, monkeypatch, ctx, offline=offline)
@@ -531,7 +552,7 @@ def test_a_batch_replay_scores_the_batch_figure(tmp_path, monkeypatch, ctx, caps
     path = rules_run(tmp_path, monkeypatch, ctx, results={**SERVED, FP8_TRITON: (12.5, 1600.0, "TRITON_ATTN")})
     main(["replay", str(path), "--repeats", "1", "--goal", "batch"])
     text = capsys.readouterr().out
-    assert "| rules |  | 1 | 0 | 0 | 5.0 | 40 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
+    assert "| rules |  | 1 | 0 | 0 | 5.0 | 44 | 4 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
     assert f"Truth: `{FP8_TRITON}`; tied with it: none." in text
     configs = [line.split(" | ")[0] for line in text.splitlines() if line.startswith("| `")]
     assert configs[0] == f"| `{FP8_TRITON}`" and configs[-1] == "| `attention_backend=TRITON_ATTN`"
@@ -622,7 +643,7 @@ def test_replay_prints_a_summary_and_writes_every_repeat(tmp_path, monkeypatch, 
     out = tmp_path / "replay.json"
     main(["replay", str(path), "--repeats", "2", "--out", str(out)])
     text = capsys.readouterr().out
-    assert "| rules |  | 2 | 0 | 0 | 5.0 | 40 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
+    assert "| rules |  | 2 | 0 | 0 | 5.0 | 44 | 4 | 1.00 | 1.00 | 1.000 | 1.000 |" in text
     assert f"Truth: `{FP8_INT8}`; tied with it: `{FP8_INT8_TRITON}`." in text
     written = json.loads(out.read_text())
     assert (written["planner"], len(written["repeats"]), written["summary"]["gaps"]) == ("rules", 2, 0)
