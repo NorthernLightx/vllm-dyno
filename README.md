@@ -27,7 +27,7 @@ uv run dyno load runs/qwen2.5-1.5b
 11:56:06  plan     fit stops: No config left, loaded next, would be recommended in 10% of 256 draws of the fitted gains; the likeliest, kv_cache_dtype=int8_per_token_head attention_backend=TRITON_ATTN, would in 2%.
 ```
 
-`dyno run` took 15 minutes to measure quality and speed in vLLM's offline engine, where fp8 weights were the fastest config within the default KL limit of 0.05. `dyno load` then measured the baseline under load and served seven of the 29 configs the offline run allowed, one at a time, in 58 minutes:
+`dyno run` took 15 minutes to measure quality and speed in vLLM's offline engine, where fp8 weights were the fastest config within the default KL limit of 0.05. `dyno load` then measured the baseline under load and served seven of the 29 configs the offline run allowed, one at a time, in 58 minutes. Four of its five combination trials came from earlier sessions on the same offline run; a fresh run would take about 4 minutes more.
 
 | config | attention | expected chat | chat req/s | batch tok/s | KL |
 |---|---|---|---|---|---|
@@ -107,7 +107,7 @@ Under WSL, the Windows graphics driver moves GPU memory into system memory inste
 - `llm` asks a language model through any OpenAI-compatible endpoint.
 - `all` serves every allowed config, which measures the whole space.
 
-Whichever planner chose them, the recommendation follows the same rule over the configs served. Each pick goes into `runs/<run>/plan.jsonl` and the report, with the planner's reasoning and its expected and measured gains.
+Whichever planner chose them, the recommendation follows the same rule over the configs served. Each pick of the fit, LLM and all planners goes into `runs/<run>/plan.jsonl` and the report, with the planner's reasoning and its expected and measured gains; the rules leave their configs in `runs/<run>/load.jsonl` only.
 
 The fit planner models a config's log chat gain, and its log batch gain, as a sum of one weight per value the config changes from the baseline. Each weight starts from half the log offline throughput gain of its value, since offline speed misjudges some settings under load, and every server's measurement updates the weights by Bayesian linear regression. vLLM picks the attention backend by the KV cache format, so a config that leaves the backend to vLLM counts as running the backend that servers with its KV cache format picked. At each step the planner draws 256 sets of gains from the fit, applies the recommendation rule to each, and serves the config that the most draws recommend.
 
@@ -115,14 +115,14 @@ No planner may stop before the effect of every setting it can change is known: t
 
 #### How the planners compare
 
-To compare planners on the same footing, `--planner all` served every allowed config of each model; those measurements are the ground truth. `dyno replay` then runs a planner many times against the recorded measurements instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. A replayed session recommends by the same rule as a real one, and is scored by whether its pick matches the recommendation over every config's mean gains, or falls among the configs tied with it (within 10% on both profiles). GPU minutes add the servers' and the offline trials' wall time.
+To compare planners on the same footing, `--planner all` served every allowed config of each model. `dyno replay` then runs a planner many times against the recorded measurements of every session of that model instead of GPU servers: each server it asks for is answered with a recorded measurement of that config, scaled to a recorded baseline. The truth is what the recommendation rule picks over each config's mean gains across those sessions. A replayed session recommends by the same rule as a real one, and is scored by whether its pick is the truth's config, or one within 10% of the best config's chat capacity (the profile the goal names). GPU minutes add the servers' and the offline trials' wall time.
 
 Over 100 replayed sessions per planner, with chat as the goal:
 
 | Qwen2.5-1.5B-Instruct (3 sessions, 2 of them a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
 |---|---|---|---|---|
 | rules | 10.0 | 81 | 1.00 | 1.00 |
-| fit | 6.4 | 56 | 1.00 | 1.00 |
+| fit | 6.3 | 55 | 1.00 | 1.00 |
 | fit, 5 servers | 5.0 | 45 | 0.99 | 1.00 |
 | Optuna TPE, 10 servers | 10.0 | 88 | 0.96 | 1.00 |
 | Optuna TPE, 5 servers | 5.0 | 45 | 0.55 | 1.00 |
@@ -132,7 +132,7 @@ Over 100 replayed sessions per planner, with chat as the goal:
 | Qwen3-1.7B (9 sessions, 1 a full sweep) | servers | GPU minutes | same pick as the truth | tied with the truth |
 |---|---|---|---|---|
 | rules | 13.3 | 106 | 0.07 | 0.92 |
-| fit | 8.4 | 78 | 0.23 | 0.95 |
+| fit | 8.4 | 78 | 0.24 | 0.94 |
 | fit, 5 servers | 5.0 | 49 | 0.16 | 0.81 |
 | Optuna TPE, 10 servers | 10.0 | 96 | 0.06 | 1.00 |
 | Optuna TPE, 5 servers | 5.0 | 51 | 0.03 | 0.99 |
@@ -148,7 +148,7 @@ Over 100 replayed sessions per planner, with chat as the goal:
 | random, 10 servers | 8.0 | 66 | 1.00 | 1.00 |
 | random, 5 servers | 5.0 | 44 | 0.53 | 0.99 |
 
-Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are tied with the truth there, and which of them a session ends on decides the "same pick" column. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules. SmolLM2-1.7B-Instruct has no quantized checkpoints from its publisher and could not run ngram, which leaves nine allowed configs, seven of them distinct engines; the fit planner found the truth's config there with four servers in every session.
+Servers do not count the baseline. The Optuna planner serves the three configs with the best offline estimate first, then lets TPE choose. On Qwen3-1.7B, whose servers run out of KV cache before anything else, the configs fastest offline are also the fastest under load, so TPE's offline-first start is enough. Eight other configs are within 10% of the best there, and which of them a session ends on decides the "same pick" column: the sweep session alone recommended GPTQ-Int8 with the int8 KV cache, while over the means of all nine sessions the rule picks fp8 weights with TRITON_ATTN. On Qwen2.5-1.5B, the gain comes from TRITON_ATTN, which offline speed does not show, and the fit planner found the truth's config in every session with fewer servers than the rules. SmolLM2-1.7B-Instruct has no quantized checkpoints from its publisher and could not run ngram, which leaves nine allowed configs, seven of them distinct engines; the fit planner found the truth's config there with four servers in every session.
 
 Real sessions; within each model they ran on copies of the same offline run and under the same load code:
 
