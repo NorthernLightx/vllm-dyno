@@ -165,8 +165,27 @@ def test_once_every_setting_is_known_it_stops_when_no_config_left_is_likely_to_w
     assert s.untried == []
     p = FitProposer().propose(s)
     assert p.config is None
-    assert p.hypothesis.startswith("No config left wins 10% of 256 draws of the fitted gains; the likeliest, ")
-    assert json.loads(s.step_file.read_text())["pick"] is None
+    assert p.hypothesis.startswith(
+        "No config left, loaded next, would be recommended in 10% of 256 draws of the fitted gains; the likeliest, "
+    )
+    recorded = json.loads(s.step_file.read_text())
+    assert recorded["pick"] is None
+    assert max(c["change"] for c in recorded["configs"]) < fit.STOP_P
+
+
+def test_it_goes_on_while_one_of_many_similar_configs_is_likely_to_win(tmp_path, ctx):
+    # eight checkpoints ran 1.5x offline and none has served; with the KV cache dtype and the backend, which
+    # served at 1.0x and cost no KL, each comes in four configs that split the draws they win between them
+    checkpoints = [f"weights=org/base-Q{i}" for i in range(1, 9)]
+    trials = [*SETTLED[:2], screen(INT8, 1000, 0.0), SETTLED[3], *(screen(q, 1500, 0.001) for q in checkpoints)]
+    loads = [served(label, 10, 1000) for label in ("baseline", FP8, INT8, TRITON)]
+    s = step(tmp_path, ctx, trials, loads)
+    assert s.untried == []
+    p = FitProposer().propose(s)
+    recorded = {c["config"]: c for c in json.loads(s.step_file.read_text())["configs"]}
+    assert max(c["win"] for c in recorded.values()) < fit.STOP_P
+    assert p.config is not None and p.config.weights in {cand(q).weights for q in checkpoints}
+    assert recorded[p.config.label()]["change"] > 0.5
 
 
 def test_it_does_not_stop_while_a_setting_is_untried_however_unlikely_the_configs_that_settle_it(tmp_path, ctx):

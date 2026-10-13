@@ -9,13 +9,17 @@ weight of that format would hold the backend's effect too, and a config naming b
 
 At each step the planner draws gains of the configs it may pick from the fit, keeps the measured gains of
 the configs that served, and applies the report's recommendation rule to each draw. A config's win
-probability is the share of draws that recommend it. While the effect under load of a setting is not
-known, the planner picks among the configs that differ from one that served in such a setting alone, so
-that its stop counts; after that among all, until none wins STOP_P of the draws. It leaves out a config
-that names the attention backend the server of its auto twin picked anyway, which starts no server.
+probability is the share of draws that recommend it when every config it may pick is in the draw, and
+its change probability the share that recommend it when it alone joins the configs that served. While
+the effect under load of a setting is not known, the planner picks among the configs that differ from one
+that served in such a setting alone, so that its stop counts; after that among all. It stops once no
+config would change the recommendation in STOP_P of the draws: similar configs split the win
+probability between them, so a stop on it would come while one of them is still likely to win. It leaves
+out a config that names the attention backend the server of its auto twin picked anyway, which starts no
+server.
 
-<run>/plan/*.json    the fitted weights, and each config's predicted gains, KL and win probability, which is
-                     null for a config the step did not let it pick
+<run>/plan/*.json    the fitted weights, and each config's predicted gains, KL, and win and change
+                     probabilities, which are null for a config the step did not let it pick
 """
 
 from __future__ import annotations
@@ -207,6 +211,14 @@ def _x(gain: list[float]) -> str:
     return f"{gain[0]:.2f}x (90% interval {gain[1]:.2f}x to {gain[2]:.2f}x)"
 
 
+@dataclass(frozen=True)
+class Shares:
+    """Per config, shares of DRAWS draws of the fitted gains that recommend it."""
+
+    win: dict[Candidate, float]  # with every config it may pick in the draw
+    change: dict[Candidate, float]  # with it alone joining the configs that served
+
+
 def win_shares(
     model: Fit,
     served: dict[str, tuple[float, float, float]],
@@ -215,27 +227,29 @@ def win_shares(
     goal: Goal,
     target: str,
     seed: int,
-) -> dict[Candidate, float]:
-    """Per config of pool, the share of DRAWS draws of its gains from the fit that recommend it for target.
+) -> Shares:
+    """Per config of pool, the shares of DRAWS draws of its gains from the fit that recommend it for target.
 
     served holds the chat gain, batch gain and KL of each config that served, which keep their measured
     values in every draw. A config of pool over the KL limit is never recommended.
     """
     contenders = {c.label(): c for c in pool if kl[c] <= goal.max_kl}
-    if not contenders:
-        return dict.fromkeys(pool, 0.0)
-    wins = dict.fromkeys(pool, 0)
-    rng = random.Random(seed)
-    chat, batch = model.chat.draws(rng, DRAWS), model.batch.draws(rng, DRAWS)
-    xs = {label: model.x(c) for label, c in contenders.items()}
-    for wc, wb in zip(chat, batch):
-        drawn = {
-            label: (math.exp(_dot(x, wc)), math.exp(_dot(x, wb)), kl[contenders[label]]) for label, x in xs.items()
-        }
-        winner = load_winner(served | drawn, target)[0]
-        if winner in contenders:
-            wins[contenders[winner]] += 1
-    return {c: n / DRAWS for c, n in wins.items()}
+    wins, changes = dict.fromkeys(pool, 0), dict.fromkeys(pool, 0)
+    if contenders:
+        rng = random.Random(seed)
+        chat, batch = model.chat.draws(rng, DRAWS), model.batch.draws(rng, DRAWS)
+        xs = {label: model.x(c) for label, c in contenders.items()}
+        for wc, wb in zip(chat, batch):
+            drawn = {
+                label: (math.exp(_dot(x, wc)), math.exp(_dot(x, wb)), kl[contenders[label]]) for label, x in xs.items()
+            }
+            winner = load_winner(served | drawn, target)[0]
+            if winner in contenders:
+                wins[contenders[winner]] += 1
+            for label, score in drawn.items():
+                if load_winner(served | {label: score}, target)[0] == label:
+                    changes[contenders[label]] += 1
+    return Shares({c: n / DRAWS for c, n in wins.items()}, {c: n / DRAWS for c, n in changes.items()})
 
 
 class FitProposer:
@@ -247,7 +261,7 @@ class FitProposer:
         self.seed = seed
 
     def propose(self, step: Step) -> Proposal:
-        """While a setting is untried, the likeliest config that settles one; then the likeliest, or a stop."""
+        """While a setting is untried, the likeliest winner that settles one; then the likeliest winner, or a stop."""
         records, load = step.session.run.records, load_records(step.session.run.path)
         served = {candidate_of(r) for r in load if r["status"] == "ok"}
         # plan() starts no server for a config that names the backend its auto twin's server picked anyway;
@@ -259,14 +273,16 @@ class FitProposer:
         model = fit(records, load, step.options)
         kl = {c: predicted_kl(records, c) for c in step.options}
         scores = {label: s for label, (_, s) in load_scores(load, records, step.goal).items()}
-        p = win_shares(model, scores, pool, kl, step.goal, step.target, self.seed)
+        shares = win_shares(model, scores, pool, kl, step.goal, step.target, self.seed)
+        p = shares.win
         best = max(pool, key=p.__getitem__)  # the first of equals, in the order of the options
         g = model.predicted_gains(best)
-        if not step.untried and p[best] < STOP_P:
+        changer = max(pool, key=shares.change.__getitem__)
+        if not step.untried and shares.change[changer] < STOP_P:
             proposal = Proposal(
                 None,
-                f"No config left wins {STOP_P:.0%} of {DRAWS} draws of the fitted gains; "
-                f"the likeliest, {best.label()}, wins {p[best]:.0%}.",
+                f"No config left, loaded next, would be recommended in {STOP_P:.0%} of {DRAWS} draws of the "
+                f"fitted gains; the likeliest, {changer.label()}, would in {shares.change[changer]:.0%}.",
             )
         else:
             odds = f"{p[best]:.0%} of {DRAWS} draws of the fitted gains: chat {_x(g['chat'])}, batch {_x(g['batch'])}."
@@ -277,13 +293,11 @@ class FitProposer:
             else:
                 hypothesis = f"Wins {odds}"
             proposal = Proposal(best, hypothesis, g["chat"][0], g["batch"][0])
-        step.step_file.write_text(_step(model, step.options, kl, p, proposal))
+        step.step_file.write_text(_step(model, step.options, kl, shares, proposal))
         return proposal
 
 
-def _step(
-    model: Fit, options: list[Candidate], kl: dict[Candidate, float], p: dict[Candidate, float], pick: Proposal
-) -> str:
+def _step(model: Fit, options: list[Candidate], kl: dict[Candidate, float], shares: Shares, pick: Proposal) -> str:
     weights = {}
     for i, (k, v) in enumerate(model.values):
         unit = [float(j == i) for j in range(len(model.values))]
@@ -291,7 +305,8 @@ def _step(
     configs = [
         {
             "config": c.label(),
-            "win": p.get(c),
+            "win": shares.win.get(c),
+            "change": shares.change.get(c),
             "kl": kl[c] if math.isfinite(kl[c]) else None,
             **model.predicted_gains(c),
         }
