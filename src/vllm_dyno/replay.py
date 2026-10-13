@@ -8,8 +8,9 @@ given run: a server's measurement (load.measure_config), a combination's offline
 A server's measurement is one load record of its config drawn at random, with its gains against
 the baseline of its own session applied to a baseline record drawn once per repeat, so every ratio
 a session sees is a ratio that was measured. A config naming the attention backend its auto-backend
-twin's server picked anyway runs the same engine, and shares the twin's records. A config that no
-run measured, under load or offline, ends its repeat as a gap: nothing is estimated. A proposer that
+twin's server picked anyway runs the same engine, and shares the twin's records, its offline trial
+included where no run tried the config itself. A config that no run measured, under load or offline,
+ends its repeat as a gap: nothing is estimated. A proposer that
 fails ends its repeat as a fallback: `dyno load` hands its session to the rules, whose pick is not
 the proposer's.
 
@@ -274,13 +275,31 @@ def _run_trial(rec: Recorded) -> Callable[..., dict]:
         key = trial_key(stage, cand)
         if found := run.find(key):
             return found
-        if key not in rec.offline:
+        if key in rec.offline:
+            record = dict(rec.offline[key])
+        elif (twin := rec.engine(cand)) != cand and (theirs := _trial_of(run, rec, stage, twin)):
+            # one engine measures one quality offline; the session then skips cand as the twin's engine
+            record = theirs | {
+                "key": key,
+                "stage": stage,
+                "label": cand.label(),
+                **asdict(cand),
+                "stand_in": twin.label(),
+            }
+        else:
             raise ReplayGap(cand.label(), "offline")
-        record = dict(rec.offline[key])
         run.append(record)
         return record
 
     return run_trial
+
+
+def _trial_of(run: Run, rec: Recorded, stage: str, cand: Candidate) -> dict | None:
+    """cand's offline trial in this session's run or another run: of the stage asked for, else of screen."""
+    for key in (trial_key(stage, cand), trial_key("screen", cand)):
+        if found := run.find(key) or rec.offline.get(key):
+            return found
+    return None
 
 
 @contextlib.contextmanager
@@ -651,7 +670,7 @@ def markdown(result: dict) -> str:
         prompt, completion = (s["tokens"][k] for k in planner.TOKENS)
         lines += ["", f"The endpoint counted {prompt:,} prompt and {completion:,} completion tokens in all repeats."]
     if s["gap_configs"]:
-        lines += ["", "Repeats that asked for a config no run recorded:", ""]
+        lines += ["", "Repeats that asked for a config no run recorded, which the means leave out:", ""]
         lines += [f"- `{g['config']}`, no {g['kind']} record: {g['repeats']}" for g in s["gap_configs"]]
     if s["fallback_errors"]:
         lines += ["", "Repeats whose planner failed, which `dyno load` would hand to the rules:", ""]

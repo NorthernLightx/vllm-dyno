@@ -236,6 +236,34 @@ def test_a_config_no_run_recorded_ends_its_repeat_as_a_gap(tmp_path, monkeypatch
     assert f"`{FP8_INT8}`, no {kind} record: 2" in replay.markdown(result)
 
 
+def test_a_same_engine_alias_no_run_tried_offline_takes_its_twins_trial_and_is_skipped(tmp_path, monkeypatch, ctx):
+    path = tmp_path / "singles"
+    write_run(path, ctx)
+    int8 = next(r for r in OFFLINE if r["label"] == "kv_cache_dtype=int8_per_token_head")
+    record_session(monkeypatch, path, ctx, "s1", lambda s: (s.baseline(), s.measure(int8)))
+    assert trial_key("combine", cand(INT8_TRITON)) not in {r["key"] for r in Run(path).records}
+    rec = replay.recorded([path])
+    trials = []
+
+    def drive(session: LoadSession, seed: int) -> None:  # the rules' combine step, for one combination
+        session.baseline()
+        session.measure(int8)
+        r = Searcher(session.run, session.ctx, Goal(), {}, 900).stage("combine", [cand(INT8_TRITON)], SCREEN)[0]
+        trials.append(r)
+        if r["status"] == "ok" and not session.same_engine(r):
+            session.measure(r)
+
+    outcome = replay.repeat(rec, replay.truth(rec, "chat"), drive, 0, 0, "chat")
+    assert (outcome["gap"], outcome["loaded"]) == (None, ["baseline", "kv_cache_dtype=int8_per_token_head"])
+    stand_in = trials[0]
+    assert (stand_in["key"], stand_in["label"], stand_in["attention_backend"]) == (
+        f"combine|{INT8_TRITON}",
+        INT8_TRITON,
+        "TRITON_ATTN",
+    )
+    assert (stand_in["kl"], stand_in["wall_s"], stand_in["stand_in"]) == (0.013, 60.0, int8["label"])
+
+
 class Scripted:
     """Picks the configs of a script in turn, then the first config left; raises an exception the script holds."""
 
