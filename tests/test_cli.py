@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 import signal
@@ -111,6 +112,21 @@ def test_load_hands_the_planning_loop_the_planner_it_names_and_its_server_budget
     main(["load", str(tmp_path), "--planner-model", "org/model", *argv])
     [(proposer, kw)] = calls
     assert (type(proposer), proposer.name, kw["max_servers"]) == (kind, name, budget)
+
+
+def test_each_load_session_waits_for_the_gpu_memory_free_as_it_starts(tmp_path, monkeypatch, ctx):
+    meta = {"created": "2026-10-12 10:00", "context": ctx.to_json(), "goal": asdict(Goal()), "harness_sha": HARNESS_SHA}
+    Run(tmp_path).write_meta(meta | {"env": cli._trial_env(meta)})
+    (tmp_path / "data.json").write_text(json.dumps({"speed_prompts": []}))
+    monkeypatch.setattr(cli, "_hub_offline", lambda env, ctx: env)
+    monkeypatch.setattr(cli, "_setup_logging", lambda logfile: None)
+    levels = []
+    monkeypatch.setattr(planner, "plan", lambda session, *args, **kw: levels.append(session.free_mib))
+    for free in (7000, 6200):  # the desktop took 800 MiB more before the second session
+        monkeypatch.setattr(probe, "query_gpu", lambda free=free: dataclasses.replace(ctx.gpu, free_mib=free))
+        main(["load", str(tmp_path), "--planner", "fit"])
+    assert levels == [7000, 6200]
+    assert json.loads((tmp_path / "load.json").read_text())["free_mib_at_start"] == 7000
 
 
 @pytest.mark.parametrize("value", [None, ""])

@@ -281,7 +281,6 @@ def cmd_load(args: argparse.Namespace) -> None:
     }
     meta_path = args.run_dir / "load.json"
     gpu = query_gpu()
-    free_mib = gpu.free_mib
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
         if {k: meta.get(k) for k in settings} != settings:
@@ -289,9 +288,8 @@ def cmd_load(args: argparse.Namespace) -> None:
                 f"{meta_path} was measured with other SLO settings, environment or load code; "
                 "delete load.json and load.jsonl to measure again"
             )
-        free_mib = meta["free_mib_at_start"]
     else:
-        meta = {**settings, "created": time.strftime("%Y-%m-%d %H:%M"), "free_mib_at_start": free_mib}
+        meta = {**settings, "created": time.strftime("%Y-%m-%d %H:%M"), "free_mib_at_start": gpu.free_mib}
     meta_path.write_text(json.dumps(meta | {"goal": args.goal}, indent=2))
     if gpu.free_mib < ctx.util * gpu.total_mib:
         raise SystemExit(
@@ -300,8 +298,10 @@ def cmd_load(args: argparse.Namespace) -> None:
         )
 
     pool = prompt_pool(json.loads((args.run_dir / "data.json").read_text()))
+    # each server must give back the memory free as this session starts, which the desktop can hold more of than
+    # it did in the run's first session
     session = LoadSession(
-        run, ctx, pool, slo, args.probe_seconds, _hub_offline(env, ctx), args.server_timeout, free_mib
+        run, ctx, pool, slo, args.probe_seconds, _hub_offline(env, ctx), args.server_timeout, gpu.free_mib
     )
     if args.config:
         session.baseline()
