@@ -394,7 +394,7 @@ def test_a_run_whose_load_records_name_other_load_code_than_its_load_json_is_ref
         replay.recorded([path])
 
 
-def test_only_ok_load_records_against_a_baseline_that_served_are_drawn(tmp_path, ctx):
+def test_failed_load_records_are_drawn_without_gains_and_ok_ones_against_a_baseline_that_served(tmp_path, ctx):
     path = tmp_path / "run"
     write_run(path, ctx)
     awq = "weights=org/base-AWQ"  # measured, though no offline trial here allows it
@@ -416,8 +416,64 @@ def test_only_ok_load_records_against_a_baseline_that_served_are_drawn(tmp_path,
     assert {c.label(): [(r.chat, r.batch) for r in reps] for c, reps in rec.measured.items()} == {
         "weights=fp8": [(pytest.approx(1.2), pytest.approx(1.2))],
         awq: [(pytest.approx(1.1), pytest.approx(1.5))],
+        "kv_cache_dtype=int8_per_token_head": [(None, None)],
     }
+    # a config that never served has no gains to recommend it by
     assert [r["label"] for r in replay.truth(rec, "chat").table] == ["baseline", "weights=fp8", awq]
+
+
+def test_a_server_that_failed_or_degraded_is_replayed_as_dyno_load_handled_it(tmp_path, ctx):
+    path = tmp_path / "run"
+    write_run(path, ctx)
+    fp8, int8 = "weights=fp8", "kv_cache_dtype=int8_per_token_head"
+    write_load(
+        path,
+        [
+            served("baseline", 10.0, 1000.0, "FLASH_ATTN") | {"session": "a"},
+            served(fp8, 0.0, 0.0, "FLASH_ATTN") | {"session": "a", "status": "crash", "capacity_rps": None},
+            served(int8, 6.0, 600.0, "TRITON_ATTN") | {"session": "a", "status": "degraded"},
+            served(int8, 12.0, 1200.0, "TRITON_ATTN") | {"session": "a"},
+            served("baseline", 10.0, 1000.0, "FLASH_ATTN") | {"session": "b"},
+            served(fp8, 12.0, 1200.0, "FLASH_ATTN") | {"session": "b"},
+        ],
+    )
+    rec = replay.recorded([path])
+    best = replay.truth(rec, "chat")
+    assert rec.mean_gains(cand(fp8)) == (pytest.approx(1.2), pytest.approx(1.2))
+    screen = {r["label"]: r for r in OFFLINE}
+
+    def drive(session: LoadSession, seed: int) -> None:
+        session.baseline()
+        session.measure(screen[fp8])
+        session.measure(screen[int8])
+
+    seen = set()
+    for i in range(30):
+        loaded = [(r["label"], r["status"]) for r in load_records_of(replay.repeat, rec, best, drive, i)]
+        seen.add(tuple(loaded))
+        assert loaded[1][0] == fp8 and loaded[1][1] in ("crash", "ok")
+        # a degraded server is started once more, and the second draw counts
+        assert [status for label, status in loaded if label == int8] in (
+            ["ok"],
+            ["degraded", "ok"],
+            ["degraded", "degraded"],
+        )
+    assert {loaded[1][1] for loaded in seen} == {"crash", "ok"}
+    assert any(len(loaded) == 4 for loaded in seen)
+
+
+def load_records_of(repeat, rec, best, drive, i) -> list[dict]:
+    """The load records a repeat's session wrote, kept before its run directory goes."""
+    kept: list[list[dict]] = []
+
+    def keeping(session: LoadSession, seed: int) -> None:
+        try:
+            drive(session, seed)
+        finally:
+            kept.append(load_records(session.run.path))
+
+    repeat(rec, best, keeping, i, 0, "chat")
+    return kept[0]
 
 
 def test_a_session_starts_from_the_trials_dyno_run_wrote_up_to_its_confirm_stage(tmp_path, monkeypatch, ctx):

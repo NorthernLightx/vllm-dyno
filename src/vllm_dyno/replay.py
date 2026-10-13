@@ -7,10 +7,11 @@ given run: a server's measurement (load.measure_config), a combination's offline
 
 A server's measurement is one load record of its config drawn at random, with its gains against
 the baseline of its own session applied to a baseline record drawn once per repeat, so every ratio
-a session sees is a ratio that was measured. A config naming the attention backend its auto-backend
-twin's server picked anyway runs the same engine, and shares the twin's records, its offline trial
-included where no run tried the config itself. A config that no run measured, under load or offline,
-ends its repeat as a gap: nothing is estimated. A proposer that
+a session sees is a ratio that was measured. A record of a server that failed or degraded is drawn
+as it was, so a session restarts or skips that config as `dyno load` did. A config naming the
+attention backend its auto-backend twin's server picked anyway runs the same engine, and shares the
+twin's records, its offline trial included where no run tried the config itself. A config that no
+run measured, under load or offline, ends its repeat as a gap: nothing is estimated. A proposer that
 fails ends its repeat as a fallback: `dyno load` hands its session to the rules, whose pick is not
 the proposer's.
 
@@ -81,9 +82,9 @@ def _hand_over(session: LoadSession, goal: Goal, max_combos: int, trial_timeout_
 
 @dataclass(frozen=True)
 class Replicate:
-    record: dict  # an ok load record
-    chat: float  # its gains against the baseline of its session
-    batch: float
+    record: dict  # a load record
+    chat: float | None  # its gains against the baseline of its session; None if it did not serve
+    batch: float | None
 
 
 @dataclass(frozen=True)
@@ -96,7 +97,7 @@ class Recorded:
     snapshot: list[dict]  # the trials `dyno run` wrote in the first run
     offline: dict[str, dict]  # combine trials of every run by key, the first ok one if any
     baselines: list[dict]  # ok baseline load records of every run
-    measured: dict[Candidate, list[Replicate]]  # each config's own ok load records
+    measured: dict[Candidate, list[Replicate]]  # each config's own load records
 
     def engine(self, cand: Candidate) -> Candidate:
         """The config whose engine cand runs: its auto-backend twin if the twin's server picked cand's backend."""
@@ -112,12 +113,16 @@ class Recorded:
         engine = self.engine(cand)
         return [rep for c, reps in self.measured.items() if self.engine(c) == engine for rep in reps]
 
+    def served(self, cand: Candidate) -> list[tuple[float, float]]:
+        """The chat and batch gains of each record of cand's engine whose server served."""
+        return [(r.chat, r.batch) for r in self.replicates(cand) if r.chat is not None and r.batch is not None]
+
     def mean_gains(self, cand: Candidate) -> tuple[float, float] | None:
-        """cand's mean chat and batch gain over its engine's records; None if no run measured it."""
+        """cand's mean chat and batch gain over its engine's servers that served; None if none did."""
         if cand == Candidate():
             return 1.0, 1.0
-        reps = self.replicates(cand)
-        return (fmean(r.chat for r in reps), fmean(r.batch for r in reps)) if reps else None
+        pairs = self.served(cand)
+        return (fmean(c for c, _ in pairs), fmean(b for _, b in pairs)) if pairs else None
 
     def records(self) -> list[dict]:
         """Every offline trial a recommendation may read: the snapshot, then other runs' combinations."""
@@ -170,11 +175,12 @@ def recorded(dirs: Sequence[Path]) -> Recorded:
         if other := list(dict.fromkeys(r.get("load_sha") for r in load_ if r.get("load_sha") != s["load_sha"])):
             raise SystemExit(f"{d}/load.jsonl holds records of other load code than its load.json: {other}")
         for r in load_:
-            if r["status"] != "ok":
-                continue
             if r["label"] == "baseline":
-                if r["capacity_rps"]:
+                if r["status"] == "ok" and r["capacity_rps"]:
                     baselines.append(r)
+                continue
+            if r["status"] != "ok":
+                measured.setdefault(candidate_of(r), []).append(Replicate(r, None, None))
                 continue
             chat, batch = gains(r, session_baseline(load_, r))
             if chat is not None and batch is not None:
@@ -249,12 +255,10 @@ def _measure_config(rec: Recorded, rng: random.Random, base: dict) -> Callable[.
         if not reps:
             raise ReplayGap(r["label"], "load")
         rep = rng.choice(reps)
-        out = copy.deepcopy(rep.record) | {
-            "label": r["label"],
-            **asdict(cand),
-            "capacity_rps": rep.chat * base["capacity_rps"],
-        }
-        out["batch"]["tput_tok_s"] = rep.batch * base["batch"]["tput_tok_s"]
+        out = copy.deepcopy(rep.record) | {"label": r["label"], **asdict(cand)}
+        if rep.chat is not None and rep.batch is not None:
+            out["capacity_rps"] = rep.chat * base["capacity_rps"]
+            out["batch"]["tput_tok_s"] = rep.batch * base["batch"]["tput_tok_s"]
         return out
 
     return measure_config
@@ -608,8 +612,10 @@ def replay(
             {
                 "config": r["label"],
                 "engine": rec.engine(cand).label(),
-                "load_records": len(rec.measured.get(cand, [])) if cand.changes() else len(rec.baselines),
-                "engine_records": len(rec.replicates(cand)) if cand.changes() else len(rec.baselines),
+                "load_records": sum(rep.chat is not None for rep in rec.measured.get(cand, []))
+                if cand.changes()
+                else len(rec.baselines),
+                "engine_records": len(rec.served(cand)) if cand.changes() else len(rec.baselines),
                 "chat": chat,
                 "batch": batch,
                 "kl": q["kl"] if q else None,
@@ -692,5 +698,6 @@ def markdown(result: dict) -> str:
         ]
         for c in sorted(t["configs"], key=lambda c: -c["chat"] if result["goal"] == "chat" else -c["batch"])
     ]
-    lines += markdown_table(["config", "same engine as", "load records", "engine records", "chat", "batch", "KL"], rows)
+    header = ["config", "same engine as", "served records", "engine served records", "chat", "batch", "KL"]
+    lines += markdown_table(header, rows)
     return "\n".join(lines) + "\n"
