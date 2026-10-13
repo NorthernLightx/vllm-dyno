@@ -234,6 +234,35 @@ def test_a_server_running_the_backend_its_kv_cache_format_picked_counts_that_bac
         assert model.predicted_gains(cand(label))["chat"][0] == pytest.approx(1.3, rel=0.03)
 
 
+def test_it_does_not_serve_a_config_whose_engine_served_under_another_label(tmp_path, ctx):
+    loads = [
+        served("baseline", 10, 1000) | {"backend": "FLASH_ATTN"},
+        served(INT8, 13, 1000) | {"backend": "TRITON_ATTN"},  # int8 KV runs TRITON_ATTN on its own
+        served(TRITON, 13, 1000) | {"backend": "TRITON_ATTN"},
+        served(FP8, 12, 1200) | {"backend": "FLASH_ATTN"},
+        served(f"{FP8} {INT8} {TRITON}", 16, 1300) | {"backend": "TRITON_ATTN"},
+    ]
+    s = step(tmp_path, ctx, SETTLED, loads)
+    assert cand(f"{FP8} {INT8}") in s.options  # same_engine only skips the named twin of an auto config that served
+    FitProposer().propose(s)
+    recorded = {c["config"]: c for c in json.loads(s.step_file.read_text())["configs"]}
+    assert recorded[f"{FP8} {INT8}"]["win"] is None and recorded[f"{FP8} {INT8}"]["change"] is None
+
+
+def test_past_coverage_it_serves_only_a_config_that_could_change_the_recommendation(tmp_path, ctx, monkeypatch):
+    s = step(tmp_path, ctx, SETTLED, SINGLES)
+    assert s.untried == []
+    likely, changer = cand(f"{FP8} {TRITON}"), cand(f"{FP8} {INT8}")
+
+    def shares(model, served, pool, kl, goal, target, seed):
+        win = {c: 0.5 if c == likely else 0.05 for c in pool}
+        change = {c: 0.2 if c == changer else 0.05 for c in pool}
+        return fit.Shares(win, change)
+
+    monkeypatch.setattr(fit, "win_shares", shares)
+    assert FitProposer().propose(s).config == changer  # not the likeliest winner, whose own change share is 5%
+
+
 NEAR_LIMIT = [  # fp8 and int8 KV are each within the KL limit of 0.05, and their KLs add up to more
     screen("baseline", 1000, 0.0),
     screen(FP8, 1000, 0.03),

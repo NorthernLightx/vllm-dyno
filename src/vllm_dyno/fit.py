@@ -12,11 +12,11 @@ the configs that served, and applies the report's recommendation rule to each dr
 probability is the share of draws that recommend it when every config it may pick is in the draw, and
 its change probability the share that recommend it when it alone joins the configs that served. While
 the effect under load of a setting is not known, the planner picks among the configs that differ from one
-that served in such a setting alone, so that its stop counts; after that among all. It stops once no
-config would change the recommendation in STOP_P of the draws: similar configs split the win
+that served in such a setting alone, so that its stop counts; after that among the configs whose change
+probability is at least STOP_P, and it stops once there are none: similar configs split the win
 probability between them, so a stop on it would come while one of them is still likely to win. It leaves
-out a config that names the attention backend the server of its auto twin picked anyway, which starts no
-server.
+out a config whose engine served already, such as one that names the attention backend the server of its
+auto twin picked anyway, which starts no server.
 
 <run>/plan/*.json    the fitted weights, and each config's predicted gains, KL, and win and change
                      probabilities, which are null for a config the step did not let it pick
@@ -264,9 +264,14 @@ class FitProposer:
         """While a setting is untried, the likeliest winner that settles one; then the likeliest winner, or a stop."""
         records, load = step.session.run.records, load_records(step.session.run.path)
         served = {candidate_of(r) for r in load if r["status"] == "ok"}
-        # plan() starts no server for a config that names the backend its auto twin's server picked anyway;
-        # once only such configs are left, picking them runs the list out and ends the session
-        options = [c for c in step.options if not step.session.same_engine(asdict(c))] or step.options
+        backends = picked_backends(load)
+        ran = {engine(c, backends) for c in served}
+        # plan() starts no server for a config that names the backend its auto twin's server picked anyway, and
+        # a config whose engine served already would only measure that engine again; once only such configs are
+        # left, picking them runs the list out and ends the session
+        options = [
+            c for c in step.options if not step.session.same_engine(asdict(c)) and engine(c, backends) not in ran
+        ] or step.options
         settles = {c: _settles(c, served, step.untried) for c in options}
         # none settles a setting alone once each config that would has failed under load
         pool = [c for c in options if settles[c]] or options
@@ -275,8 +280,6 @@ class FitProposer:
         scores = {label: s for label, (_, s) in load_scores(load, records, step.goal).items()}
         shares = win_shares(model, scores, pool, kl, step.goal, step.target, self.seed)
         p = shares.win
-        best = max(pool, key=p.__getitem__)  # the first of equals, in the order of the options
-        g = model.predicted_gains(best)
         changer = max(pool, key=shares.change.__getitem__)
         if not step.untried and shares.change[changer] < STOP_P:
             proposal = Proposal(
@@ -285,6 +288,10 @@ class FitProposer:
                 f"fitted gains; the likeliest, {changer.label()}, would in {shares.change[changer]:.0%}.",
             )
         else:
+            if not step.untried:  # a server is worth it only for a config that could change the recommendation
+                pool = [c for c in pool if shares.change[c] >= STOP_P]
+            best = max(pool, key=p.__getitem__)  # the first of equals, in the order of the options
+            g = model.predicted_gains(best)
             odds = f"{p[best]:.0%} of {DRAWS} draws of the fitted gains: chat {_x(g['chat'])}, batch {_x(g['batch'])}."
             if settles[best]:
                 ref = best.replace(**{settles[best][0]: DEFAULTS[settles[best][0]]}).label()
