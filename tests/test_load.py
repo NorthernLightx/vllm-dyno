@@ -302,6 +302,13 @@ def test_every_session_measures_the_baseline_again_and_reuses_other_configs(tmp_
     ]
 
 
+def test_a_session_asked_for_its_baseline_again_reuses_the_one_it_served(tmp_path, monkeypatch, ctx):
+    s, measured = session(tmp_path, monkeypatch, ctx, "night")
+    first = s.baseline()
+    assert s.baseline() == first  # as when the rules finish a session a planner started
+    assert measured == ["baseline"]
+
+
 def test_a_degraded_server_is_started_once_more_and_its_config_measured_again_in_later_sessions(
     tmp_path, monkeypatch, ctx
 ):

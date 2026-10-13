@@ -710,6 +710,10 @@ class LoadSession:
         return record
 
     def baseline(self) -> dict:
+        """The baseline's load record in this session: measured now, unless the session measured it already."""
+        mine = session_baseline(load_records(self.run.path), {"session": self.id})
+        if mine is not None and mine["status"] == "ok":
+            return mine
         r = next((r for r in self.run.records if r["label"] == "baseline" and r["status"] == "ok"), None)
         if r is None:
             raise SystemExit(f"{self.run.path} has no successful baseline trial")
